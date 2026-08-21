@@ -13,10 +13,19 @@
 #include "tla/layout.hpp"
 
 #include "fag_common.h"
+<<<<<<< HEAD
+=======
+#include "fag_epilogue_post.hpp"
+#include "fag_epilogue_pre.hpp"
+>>>>>>> origin/integration/FAG-V3-A5
 #include "fag_block.h"
 #include "fag_mmad_sdp.hpp"
 #include "fag_mmad_dqkv.hpp"
 #include "fag_epilogue_scaled_mask_softmax.hpp"
+<<<<<<< HEAD
+=======
+#include "fag_epilogue_softmax_grad_front.hpp"
+>>>>>>> origin/integration/FAG-V3-A5
 #include "fag_epilogue_sub_mul.hpp"
 #include "kernel_operator.h"
 
@@ -212,6 +221,7 @@ public:
             resource,
             params.workspace,
             params.tiling);
+<<<<<<< HEAD
         // TODO-------------------
         // AscendC::TPipe pipePre;
         // EpilogueFAGPre epilogueFagPre(xxxx);
@@ -222,16 +232,31 @@ public:
         // EpilogueFAGSfmg epilogueFagSfmg(xxxx);
         // epilogueFagSfmg();
         // pipeSoftmaxGrad.Destroy();
+=======
+        epiloguePre_.Init(resource, params.workspace, params.tiling);
+        epilogueSoftmaxGradFront_.Init(
+            resource, params.dout, params.out, params.workspace,
+            params.tiling);
+        epiloguePost_.Init(
+            resource, params.dq, params.dk, params.dv, params.workspace,
+            params.tiling);
+        const uint32_t vectorCoreNum = coreNum_ * subBlockNum;
+        epiloguePre_(
+            vectorBlockIdx, vectorCoreNum, vWaitMte3Ping);
+        epilogueSoftmaxGradFront_(
+            vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping,
+            mte3WaitMte2Pong, vWaitMte2Ping, vWaitMte2Pong,
+            vWaitMte3Ping, vWaitMte3Pong);
+>>>>>>> origin/integration/FAG-V3-A5
 #endif
         AscendC::SyncAll<false>();
         RunTasks(coreIdx, subBlockIdx);
         AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
-        // TODO-------------------
-        // AscendC::TPipe pipePost;
-        // EpilogueFAGPost epilogueFagPost(xxxx);
-        // epilogueFagPost();
-        // pipePost.Destroy();
+        epiloguePost_(
+            vectorBlockIdx, vectorCoreNum, mte3WaitMte2Ping,
+            mte3WaitMte2Pong, vWaitMte2Ping, vWaitMte2Pong,
+            vWaitMte3Ping, vWaitMte3Pong);
 #endif
     }
 
@@ -243,6 +268,13 @@ private:
     {
         vWaitMte2Ping = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
         vWaitMte2Pong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
+<<<<<<< HEAD
+=======
+        vWaitMte3Ping = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+        vWaitMte3Pong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+        mte3WaitMte2Ping = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
+        mte3WaitMte2Pong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
+>>>>>>> origin/integration/FAG-V3-A5
         lseMte2WaitVPing = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
         lseMte2WaitVPong = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
         deltaMte2WaitVPing = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
@@ -853,8 +885,20 @@ private:
 private:
     Catlass::Arch::Resource<Catlass::Arch::Ascend950> resource;
 #ifdef __DAV_VEC__
+<<<<<<< HEAD
     EpilogueScaledMaskSoftmax epilogueScaledMaskSoftmax_;
     EpilogueSubMul epilogueSubMul_;
+=======
+    Catlass::Epilogue::Block::FagPre<
+        Catlass::Arch::Ascend950, TilingData> epiloguePre_;
+    Catlass::Epilogue::Block::FagSoftmaxGradFront<
+        DataType, Catlass::Arch::Ascend950,
+        TilingData> epilogueSoftmaxGradFront_;
+    EpilogueScaledMaskSoftmax epilogueScaledMaskSoftmax_;
+    EpilogueSubMul epilogueSubMul_;
+    Catlass::Epilogue::Block::FagPost<
+        DataType, Catlass::Arch::Ascend950, TilingData> epiloguePost_;
+>>>>>>> origin/integration/FAG-V3-A5
 #endif
 
     const __gm__ TilingData *tiling_ = nullptr;
@@ -883,6 +927,13 @@ private:
 
     event_t vWaitMte2Ping;
     event_t vWaitMte2Pong;
+<<<<<<< HEAD
+=======
+    event_t vWaitMte3Ping;
+    event_t vWaitMte3Pong;
+    event_t mte3WaitMte2Ping;
+    event_t mte3WaitMte2Pong;
+>>>>>>> origin/integration/FAG-V3-A5
     event_t lseMte2WaitVPing;
     event_t lseMte2WaitVPong;
     event_t deltaMte2WaitVPing;
