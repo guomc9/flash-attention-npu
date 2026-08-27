@@ -28,6 +28,7 @@ var/
 # IDE-related
 .idea/
 .vscode/
+.clangd
 
 # Dev
 venv

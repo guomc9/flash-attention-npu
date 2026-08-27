@@ -32,6 +32,7 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
     tiling.deterministic = info.deterministic;
     tiling.aicNum = info.aicNum;
     tiling.aivNum = info.aivNum;
+    // tiling.
     tiling.continuousBlockNum = info.continuousBlockNum;
     tiling.ubSize = info.ubSize;
     tiling.batch = info.batch;

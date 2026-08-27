@@ -38,6 +38,7 @@ struct FAGInfo {
     Layout layout = Layout::BSND;
     MaskType maskType = MaskType::NO_MASK;
     uint32_t deterministic = 0;
+    uint32_t dqPostAbsorb = 0;
 
     uint64_t batch = 0;
     uint64_t qSeqlen = 0;
@@ -51,6 +52,9 @@ struct FAGInfo {
 
     uint32_t aicNum = 0;
     uint32_t aivNum = 0;
+    uint32_t dqVecNum = 0;
+    uint32_t dkVecNum = 0;
+    uint32_t dvVecNum = 0;
     uint32_t continuousBlockNum = DEFAULT_CONTINUOUS_BLOCK_NUM;
     uint64_t ubSize = 0;
     float scaleValue = 1.0f;
@@ -61,6 +65,8 @@ struct FAGTilingData {
     uint32_t layout = 0;
     uint32_t maskType = 0;
     uint32_t deterministic = 0;
+    uint32_t dqPostAbsorb = 0;
+    uint32_t dqVecNum = 0, dkVecNum = 0, dvVecNum = 0;
     uint32_t aicNum = 0;
     uint32_t aivNum = 0;
     uint32_t usedCoreNum = 0;
@@ -88,6 +94,9 @@ struct FAGTilingData {
     uint64_t dkOffset = 0;
     uint64_t dvOffset = 0;
     uint64_t deltaOffset = 0;
+    uint64_t dqDetOffset = 0;
+    uint64_t dkDetOffset = 0;
+    uint64_t dvDetOffset = 0;
     uint64_t workspaceSize = 0;
 };
 
