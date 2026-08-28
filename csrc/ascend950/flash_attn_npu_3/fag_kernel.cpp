@@ -133,6 +133,34 @@ public:
             ? scaleValue_ / softcapValue_
             : scaleValue_;
 
+        if constexpr (IS_DTM) {
+            // Det slot geometry must match fag_tiling.cpp: one slot is
+            // qTile/kvTile rows of RoundUp(headDim, 8) floats.
+            qkHeadDimAlign_ = (qkHeadDim_ + 7) / 8 * 8;
+            vHeadDimAlign_ = (vHeadDim_ + 7) / 8 * 8;
+            dqDetSlotElems_ =
+                static_cast<uint64_t>(qBlockSize_) * qkHeadDimAlign_;
+            dkDetSlotElems_ =
+                static_cast<uint64_t>(kvBlockSize_) * qkHeadDimAlign_;
+            dvDetSlotElems_ =
+                static_cast<uint64_t>(kvBlockSize_) * vHeadDimAlign_;
+            // Every core derives the same total task/round count so that
+            // the v1 round-end SyncAll barriers are joined uniformly,
+            // independent of how many tasks each core actually issued.
+            totalBlockNum_ = 0;
+            for (uint32_t b = 0; b < batchNum_; ++b) {
+                uint64_t qStart = 0, kvStart = 0;
+                uint32_t s1Len = 0, s2Len = 0;
+                GetBatchShape(b, qStart, kvStart, s1Len, s2Len);
+                const uint32_t s1BlkNum = static_cast<uint32_t>(
+                    CeilDiv(s1Len, qBlockSize_));
+                totalBlockNum_ += kvHeadNum_ * groupNum_ *
+                    CountValidS2Blocks(s1Len, s2Len, s1BlkNum);
+            }
+            totalRounds_ = static_cast<uint32_t>(
+                CeilDiv(totalBlockNum_, waveSize_));
+        }
+
         // L1 layout:
         //   [P ping][P pong][dS ping][dS pong]
         const uint32_t l1TileBytes =
@@ -600,6 +628,10 @@ private:
         SetVecEvents();
 #endif
         uint64_t taskId = 0;
+        // IS_DTM only: previousBlock_'s back-end (C5/C34/V1/V2) has not been
+        // processed yet.  Tracked explicitly because the round-end flush
+        // consumes it outside the usual "next task issues" trigger.
+        bool pendingBackend = false;
         for (uint32_t issueRound = 0;; ++issueRound) {
             const uint64_t blockBegin =
                 static_cast<uint64_t>(issueRound) * waveSize_ +
@@ -609,18 +641,82 @@ private:
                  issueLane < continuousBlockNum_; ++issueLane) {
                 FAGBlockInfo block{};
                 if (!DecodeBlock(blockBegin + issueLane, block)) {
-                    if (taskId != 0) {
-                        // Drain the last task. There is no following task, so
-                        // its L1 buffers do not need to be returned.
+                    if constexpr (IS_DTM) {
+                        // No more tasks for this core in this round.  The
+                        // pending back-end is flushed at the round end below;
+                        // every core still joins the round barriers so the
+                        // SyncAll counts stay matched across cores.
+                        break;
+                    } else {
+                        if (taskId != 0) {
+                            // Drain the last task. There is no following task, so
+                            // its L1 buffers do not need to be returned.
 #ifdef __DAV_CUBE__
-                        ProcessC5Stage(previousBlock_, false, mm345);
-                        ProcessC34Stage(previousBlock_, false, mm345);
+                            ProcessC5Stage(previousBlock_, false, mm345);
+                            ProcessC34Stage(previousBlock_, false, mm345);
 #endif
 #ifdef __DAV_VEC__
-                        ProcessV1Stage(previousBlock_, subBlockIdx);
-                        ProcessV2Stage(previousBlock_, subBlockIdx);
+                            ProcessV1Stage(previousBlock_, subBlockIdx);
+                            ProcessV2Stage(previousBlock_, subBlockIdx);
 #endif
+                        }
+#ifdef __DAV_CUBE__
+                        WaitCubeEvents();
+#endif
+#ifdef __DAV_VEC__
+                        WaitVecEvents();
+#endif
+                        return;
                     }
+                }
+                block.taskId = taskId;
+                block.issueRound = issueRound;
+                block.issueLane = issueLane;
+
+                const bool hasPendingPrev =
+                    IS_DTM ? pendingBackend : (taskId != 0);
+#ifdef __DAV_CUBE__
+                // Front-end MM of task i overlaps the vector and back-end MM
+                // stages of task i - 1.
+                ProcessC1Stage(block, mm12);
+                ProcessC2Stage(block, mm12);
+                if (hasPendingPrev) {
+                    ProcessC5Stage(previousBlock_, true, mm345);
+                    ProcessC34Stage(previousBlock_, true, mm345);
+                }
+#endif
+#ifdef __DAV_VEC__
+                if (hasPendingPrev) {
+                    ProcessV1Stage(previousBlock_, subBlockIdx);
+                    ProcessV2Stage(previousBlock_, subBlockIdx);
+                }
+#endif
+
+                previousBlock_ = block;
+                ++taskId;
+                pendingBackend = true;
+            }
+
+            if constexpr (IS_DTM) {
+                // v1: flush this round's last back-end task, then
+                // barrier -> VecDTM fixed-order reduction -> barrier.
+                if (pendingBackend) {
+#ifdef __DAV_CUBE__
+                    ProcessC5Stage(previousBlock_, true, mm345);
+                    ProcessC34Stage(previousBlock_, true, mm345);
+#endif
+#ifdef __DAV_VEC__
+                    ProcessV1Stage(previousBlock_, subBlockIdx);
+                    ProcessV2Stage(previousBlock_, subBlockIdx);
+#endif
+                    pendingBackend = false;
+                }
+                AscendC::SyncAll<false>();
+#ifdef __DAV_VEC__
+                ProcessVecDTMStage();
+#endif
+                AscendC::SyncAll<false>();
+                if (issueRound + 1 >= totalRounds_) {
 #ifdef __DAV_CUBE__
                     WaitCubeEvents();
 #endif
@@ -629,29 +725,6 @@ private:
 #endif
                     return;
                 }
-                block.taskId = taskId;
-                block.issueRound = issueRound;
-                block.issueLane = issueLane;
-
-#ifdef __DAV_CUBE__
-                // Front-end MM of task i overlaps the vector and back-end MM
-                // stages of task i - 1.
-                ProcessC1Stage(block, mm12);
-                ProcessC2Stage(block, mm12);
-                if (taskId != 0) {
-                    ProcessC5Stage(previousBlock_, true, mm345);
-                    ProcessC34Stage(previousBlock_, true, mm345);
-                }
-#endif
-#ifdef __DAV_VEC__
-                if (taskId != 0) {
-                    ProcessV1Stage(previousBlock_, subBlockIdx);
-                    ProcessV2Stage(previousBlock_, subBlockIdx);
-                }
-#endif
-
-                previousBlock_ = block;
-                ++taskId;
             }
         }
     }
@@ -749,12 +822,22 @@ private:
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         auto dy = MakeGmTensor(doutGm_, block.doutOffset, block.s1Extend,
             vHeadDim_, qHeadNum_ * vHeadDim_);
-        auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset,
-            block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
-
-        mm345.ComputeDv(l1PTensor[slot], dy, dv,
-            Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
-            true);
+        if constexpr (IS_DTM) {
+            // Compact det slot: index = coreIdx * cbn + issueLane,
+            // stride/row-step use the aligned head dim (matches tiling).
+            auto dv = MakeGmTensor(dvDetWorkspaceGm_,
+                (block.blockId % waveSize_) * dvDetSlotElems_,
+                block.s2Extend, vHeadDim_, vHeadDimAlign_);
+            mm345.ComputeDv(l1PTensor[slot], dy, dv,
+                Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
+                false);
+        } else {
+            auto dv = MakeGmTensor(dvWorkspaceGm_, block.vOffset,
+                block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+            mm345.ComputeDv(l1PTensor[slot], dy, dv,
+                Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
+                true);
+        }
 
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
@@ -780,15 +863,29 @@ private:
             qkHeadDim_, kvHeadNum_ * qkHeadDim_);
         auto q = MakeGmTensor(qGm_, block.qOffset, block.s1Extend,
             qkHeadDim_, qHeadNum_ * qkHeadDim_);
-        auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset,
-            block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
-        auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset,
-            block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
-
-        mm345.ComputeDqDk(
-            l1dSTensor[slot], k, q, dq, dk,
-            Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
-            true, true);
+        if constexpr (IS_DTM) {
+            const uint64_t detSlot =
+                block.blockId % waveSize_;  // = coreIdx * cbn + issueLane
+            auto dq = MakeGmTensor(dqDetWorkspaceGm_,
+                detSlot * dqDetSlotElems_,
+                block.s1Extend, qkHeadDim_, qkHeadDimAlign_);
+            auto dk = MakeGmTensor(dkDetWorkspaceGm_,
+                detSlot * dkDetSlotElems_,
+                block.s2Extend, qkHeadDim_, qkHeadDimAlign_);
+            mm345.ComputeDqDk(
+                l1dSTensor[slot], k, q, dq, dk,
+                Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
+                false, false);
+        } else {
+            auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset,
+                block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
+            auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset,
+                block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+            mm345.ComputeDqDk(
+                l1dSTensor[slot], k, q, dq, dk,
+                Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
+                true, true);
+        }
 
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(
@@ -974,7 +1071,7 @@ private:
     CATLASS_DEVICE
     void ProcessVecDTMStage()
     {
-        
+
     }
 #endif
 
@@ -1012,6 +1109,14 @@ private:
     
     GM_ADDR detReadyCounter_ = nullptr;
     GM_ADDR detDoneCounter_ = nullptr;
+    // Det slot geometry (fp32 elements) and uniform round count (IS_DTM).
+    uint64_t qkHeadDimAlign_ = 0;
+    uint64_t vHeadDimAlign_ = 0;
+    uint64_t dqDetSlotElems_ = 0;
+    uint64_t dkDetSlotElems_ = 0;
+    uint64_t dvDetSlotElems_ = 0;
+    uint64_t totalBlockNum_ = 0;
+    uint32_t totalRounds_ = 0;
 
     AscendC::LocalTensor<DataType> l1PTensor[TASK_PINGPONG];
     AscendC::LocalTensor<DataType> l1dSTensor[TASK_PINGPONG];

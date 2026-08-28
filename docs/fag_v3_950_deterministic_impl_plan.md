@@ -100,8 +100,8 @@ dqPostAbsorb=1 时 dq 组负载最重（合并+scale+cast+写输出），v1 统�
 非确定性主流水是**连续任务流，无轮次边界同步**；确定性插入 VecDTM 需要新增握手。
 分两步走：
 
-- **v1（正确性优先）**：轮次末 `AscendC::SyncAll<false>()`（910 同款）；
-- **v2（性能）**：GM 计数器协议，VecDTM 与下一轮 C12 重叠：
+- **v1（正确性优先）**：轮次末 `AscendC::SyncAll<false>()` **全核同步，所有核到齐后再做 VecDTM 定序累加**（910 同款），不加任何新协议；
+- **v2（性能）**：GM 计数器协议，**VecDTM 与下一轮 C12 流水重叠**：
 
 ```
 同步区（workspace 起始 64KB = MULTI_CORE_SYNC_BYTES）：
@@ -124,6 +124,8 @@ readyCounter 目标为各轮参与核数的**累计和**（单调免复位）。
 ## 3. 文件修改进度总表
 
 > 行序 = 实施顺序；末列 ✅ = 已完成，🟥 = 未完成。
+> 阶段划分：**v1 = 全核同步（SyncAll）后再累加（VecDTM）**，先求正确性（条目 21-24、26-37）；
+> **v2 = ready/done 计数器 + C12 与 VecDTM 流水重叠**（条目 25、31），v1 测试全绿后再做。
 
 | # | 文件 | 具体修改需求 | 状态 |
 |---|---|---|---|
@@ -147,22 +149,23 @@ readyCounter 目标为各轮参与核数的**累计和**（单调免复位）。
 | 18 | `fag_kernel.cpp` | `LoadDecoderBatch`（:344-362）：IS_DTM 分支改算 per-s1 统计，batch 段长公式不变 | ✅ |
 | 19 | `fag_kernel.cpp` | `DecodeBlock`（:410-470）：IS_DTM 分支轴序改 bn2s1gs2——③变长扫描定 **s1**（游标换 `decoderS1BlockIdx_`，段长 = G × validS2Num(s1)）；④ `g = blockInS1 / validS2Num`，`s2 = blockInS1 % validS2Num` | ✅ |
 | 20 | `fag_kernel.cpp` | :947 游标成员换 s1 版本 | ✅ |
-| 21 | `fag_kernel.cpp` | `ProcessC5Stage/C34Stage`（:627-687）：写目标改 det 槽（紧凑布局），`enAtomic=false`；轮 r>0 首次写槽前轮询 doneCounter 放行；本轮最后任务写完后 `WaitFlag<FIX_M>` + readyCounter+1 | 🟥 |
-| 22 | `fag_kernel.cpp` | `RunTasks`（:473-544）+ drain（:500-511）：`issueLane == continuousBlockNum_-1` 时 Cube 发 ready、Vec 调 `ProcessVecDTM(issueRound)`，drain 补最后一轮 | 🟥 |
+| 21 | `fag_kernel.cpp` | `ProcessC5Stage/C34Stage` IS_DTM 分支：写目标改 det 槽（紧凑布局），`enAtomic=false`；槽索引 = `blockId % waveSize_`（= coreIdx×cbn+issueLane）；槽步长/行步长用 `RoundUp(headDim,8)`（`dq/dk/dvDetSlotElems_`），与 tiling 的 det 段大小一致；全部包在 `if constexpr (IS_DTM)` 内，非 det 路径不动 | ✅ |
+| 22 | `fag_kernel.cpp` | `RunTasks` IS_DTM 分支：轮末 flush 本轮最后任务的 C5/C34/V1/V2；`pendingBackend` 显式跟踪上一任务后端是否已消费（防轮边界重复 flush）；`Init` 内 device 端预扫描 `totalBlockNum_/totalRounds_`（逐 batch `CountValidS2Blocks`），保证所有核参与相同轮数的 barrier；非 det 路径保持原流水 | ✅ |
 | 23 | `fag_kernel.cpp` | 新增 `DecodeBlockCold(blockId)` 无状态冷解码，供 VecDTM 重建轮次任务清单；反解 `coreIdx = (blockId % waveSize) / cbn`，`lane = blockId % cbn` | 🟥 |
-| 24 | `fag_kernel.cpp` | 轮末同步：v1 用 `SyncAll<false>()`，v2 换 ready/done 计数器协议 | 🟥 |
-| 25 | `fag_epilogue_deterministic_add.hpp` | 新建 VecDTM 本体（当前为空文件占位）：结构对齐现有 epilogue（`Init(resource, workspace, tiling)` + `operator()(vectorBlockIdx, round, ...)`） | 🟥 |
-| 26 | `fag_epilogue_deterministic_add.hpp` | Vec 三分组：`vectorBlockIdx < dqVecNum` → dq；`< +dkVecNum` → dk；余 → dv；超出总和的 AIV 跳过 | 🟥 |
-| 27 | `fag_epilogue_deterministic_add.hpp` | dk/dv 组：本轮本组每块按 accumList（blockId 升序）组内 Add 合并 → `SetAtomicType<float>` + DataCopyPad 入账 | 🟥 |
-| 28 | `fag_epilogue_deterministic_add.hpp` | dq 组：组内合并 → existFirst/existLast 四分支收尾（§2.3，含 Muls/Cast 直写 dqGm） | 🟥 |
-| 29 | `fag_epilogue_deterministic_add.hpp` | UB 按 tileElements 分块流式处理；行均分沿用 FagPost 的 ceil 分段模式 | 🟥 |
-| 30 | `fag_epilogue_deterministic_add.hpp` | 收尾每组 doneCounter+1 | 🟥 |
-| 31 | `fag_epilogue_post.hpp` | :65-67 加分支：`!(deterministic && dqPostAbsorb)` 时才对 dq 走 `ProcessRegion<true>`（否则 dq 已在 VecDTM 直写 dqGm）；FagPost 范围仅 dk/dv | 🟥 |
-| 32 | `fag_mmad_dqkv.hpp` | 不改：`FixpipeTla` 已支持 `enAtomic=false` 普通覆盖写；GM 目标由调用方 tla tensor 传入 | ✅ |
-| 33 | `tests/test_flash_attn_npu_v3_bwd.py` | 解除确定性用例 `skipif`（:206、:248、:291、:337 逐个评估） | 🟥 |
-| 34 | `tests/test_flash_attn_npu_v3_bwd.py` | 新增 bit-exact 用例：同输入连跑两次，`torch.equal` 校验 dq/dk/dv 逐 bit 一致 | 🟥 |
-| 35 | `tests/test_flash_attn_npu_v3_bwd.py` | 精度对照走现有 `npu_precision_utils` 容差框架 | 🟥 |
-| 36 | `tests/test_flash_attn_npu_v3_bwd.py` | 覆盖：MHA（G=1）、GQA（G>1）、causal/非 causal、TND/BSND、尾块 | 🟥 |
+| 24 | `fag_kernel.cpp` | **v1 轮末同步**：轮次末 `AscendC::SyncAll<false>()` 全核同步 → `ProcessVecDTM` 定序累加 → 再一次 SyncAll 放行；按 `totalRounds_` 走满所有轮（无任务的核也参与 barrier），末轮后 WaitCube/VecEvents 收尾退出 | ✅ |
+| 25 | `fag_kernel.cpp` | **v2 流水重叠**：SyncAll 换 ready/done GM 计数器协议（§2.6），cube 写完本轮 det 槽 + `WaitFlag<FIX_M>` 后 readyCounter+1 直接进发下一轮 C12；VecDTM 与下一轮 C12 重叠；写槽前轮询 doneCounter 放行。依赖 v1 测试全绿后再做 | 🟥 |
+| 26 | `fag_epilogue_deterministic_add.hpp` | 新建 VecDTM 本体（当前为空文件占位）：结构对齐现有 epilogue（`Init(resource, workspace, tiling)` + `operator()(vectorBlockIdx, round, ...)`） | 🟥 |
+| 27 | `fag_epilogue_deterministic_add.hpp` | Vec 三分组：`vectorBlockIdx < dqVecNum` → dq；`< +dkVecNum` → dk；余 → dv；超出总和的 AIV 跳过 | 🟥 |
+| 28 | `fag_epilogue_deterministic_add.hpp` | dk/dv 组：本轮本组每块按 accumList（blockId 升序）组内 Add 合并 → `SetAtomicType<float>` + DataCopyPad 入账 | 🟥 |
+| 29 | `fag_epilogue_deterministic_add.hpp` | dq 组：组内合并 → existFirst/existLast 四分支收尾（§2.3，含 Muls/Cast 直写 dqGm） | 🟥 |
+| 30 | `fag_epilogue_deterministic_add.hpp` | UB 按 tileElements 分块流式处理；行均分沿用 FagPost 的 ceil 分段模式 | 🟥 |
+| 31 | `fag_epilogue_deterministic_add.hpp` | 收尾每组 doneCounter+1（v2 需要；v1 用 SyncAll 时可空） | 🟥 |
+| 32 | `fag_epilogue_post.hpp` | :65-67 加分支：`!(deterministic && dqPostAbsorb)` 时才对 dq 走 `ProcessRegion<true>`（否则 dq 已在 VecDTM 直写 dqGm）；FagPost 范围仅 dk/dv | 🟥 |
+| 33 | `fag_mmad_dqkv.hpp` | 不改：`FixpipeTla` 已支持 `enAtomic=false` 普通覆盖写；GM 目标由调用方 tla tensor 传入 | ✅ |
+| 34 | `tests/test_flash_attn_npu_v3_bwd.py` | 解除确定性用例 `skipif`（:206、:248、:291、:337 逐个评估） | 🟥 |
+| 35 | `tests/test_flash_attn_npu_v3_bwd.py` | 新增 bit-exact 用例：同输入连跑两次，`torch.equal` 校验 dq/dk/dv 逐 bit 一致（v1 全核同步版即应通过） | 🟥 |
+| 36 | `tests/test_flash_attn_npu_v3_bwd.py` | 精度对照走现有 `npu_precision_utils` 容差框架 | 🟥 |
+| 37 | `tests/test_flash_attn_npu_v3_bwd.py` | 覆盖：MHA（G=1）、GQA（G>1）、causal/非 causal、TND/BSND、尾块 | 🟥 |
 
 ## 4. 开放项（TBD）
 
