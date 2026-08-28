@@ -100,6 +100,19 @@ public:
         dvWorkspaceGm_.SetGlobalBuffer(
             (__gm__ float *)(params.workspace + tiling_->dvOffset));
 
+        if constexpr (IS_DTM) {
+            dqDetWorkspaceGm_.SetGlobalBuffer(
+                (__gm__ float *)(params.workspace + tiling_->dqDetOffset));
+            dkDetWorkspaceGm_.SetGlobalBuffer(
+                (__gm__ float *)(params.workspace + tiling_->dkDetOffset));
+            dvDetWorkspaceGm_.SetGlobalBuffer(
+                (__gm__ float *)(params.workspace + tiling_->dvDetOffset));
+            // Sync area sits at the workspace start: readyCounter @ +0,
+            // doneCounter @ +8 (see MULTI_CORE_SYNC_BYTES layout).
+            detReadyCounter_ = params.workspace;
+            detDoneCounter_ = params.workspace + sizeof(int64_t);
+        }
+
         batchNum_ = static_cast<uint32_t>(tiling_->batch);
         qSeqlen_ = static_cast<uint32_t>(tiling_->qSeqlen);
         kvSeqlen_ = static_cast<uint32_t>(tiling_->kvSeqlen);
@@ -340,6 +353,58 @@ private:
         return count;
     }
 
+    // Deterministic axis order (b -> n2 -> s1 -> g -> s2) scans s1 outer and
+    // s2 inner, so the per-s1 valid s2-block count is the segment length.
+    CATLASS_DEVICE
+    uint32_t ValidS2BlockNum(
+        uint32_t s1Length,
+        uint32_t s2Length,
+        uint32_t s1BlockIdx)
+    {
+        const uint32_t s2BlockNum =
+            static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
+        if constexpr (!IS_ATTEN_MASK) {
+            return s2BlockNum;
+        }
+
+        // Causal: kv col j is visible to q row i iff
+        // j <= i + (s2Length - s1Length).  The last visible col of this s1
+        // block is (s1BlockIdx + 1) * qBlockSize - 1 + (s2Length - s1Length).
+        const int64_t lastCol =
+            static_cast<int64_t>(s1BlockIdx + 1) * qBlockSize_ - 1 +
+            (static_cast<int64_t>(s2Length) - s1Length);
+        if (lastCol < 0) {
+            return 0;
+        }
+        return Min(
+            static_cast<uint32_t>(lastCol / kvBlockSize_),
+            s2BlockNum - 1) + 1;
+    }
+
+    CATLASS_DEVICE
+    uint32_t LastValidS2Block(
+        uint32_t s1Length,
+        uint32_t s2Length,
+        uint32_t s1BlockIdx)
+    {
+        // Mirror of FirstValidS1Block; requires ValidS2BlockNum > 0.
+        return ValidS2BlockNum(s1Length, s2Length, s1BlockIdx) - 1;
+    }
+
+    CATLASS_DEVICE
+    uint64_t CountValidS2Blocks(
+        uint32_t s1Length,
+        uint32_t s2Length,
+        uint32_t s1BlockNum)
+    {
+        uint64_t count = 0;
+        for (uint32_t s1BlockIdx = 0; s1BlockIdx < s1BlockNum;
+             ++s1BlockIdx) {
+            count += ValidS2BlockNum(s1Length, s2Length, s1BlockIdx);
+        }
+        return count;
+    }
+
     CATLASS_DEVICE
     void LoadDecoderBatch()
     {
@@ -351,14 +416,26 @@ private:
             CeilDiv(decoderS1Length_, qBlockSize_));
         decoderS2BlockNum_ = static_cast<uint32_t>(
             CeilDiv(decoderS2Length_, kvBlockSize_));
-        decoderValidS1PerN2_ = CountValidS1Blocks(
-            decoderS1Length_, decoderS2Length_, decoderS2BlockNum_);
-        decoderBatchBlockNum_ =
-            kvHeadNum_ * groupNum_ *
-            decoderValidS1PerN2_;
-        decoderN2Idx_ = 0;
-        decoderS2BlockIdx_ = 0;
-        decoderS2BlockBegin_ = 0;
+        if constexpr (IS_DTM) {
+            // Axis order b -> n2 -> s1 -> g -> s2: per-s1 valid s2 counts.
+            decoderValidS2PerN2_ = CountValidS2Blocks(
+                decoderS1Length_, decoderS2Length_, decoderS1BlockNum_);
+            decoderBatchBlockNum_ =
+                kvHeadNum_ * groupNum_ *
+                decoderValidS2PerN2_;
+            decoderN2Idx_ = 0;
+            decoderS1BlockIdx_ = 0;
+            decoderS1BlockBegin_ = 0;
+        } else {
+            decoderValidS1PerN2_ = CountValidS1Blocks(
+                decoderS1Length_, decoderS2Length_, decoderS2BlockNum_);
+            decoderBatchBlockNum_ =
+                kvHeadNum_ * groupNum_ *
+                decoderValidS1PerN2_;
+            decoderN2Idx_ = 0;
+            decoderS2BlockIdx_ = 0;
+            decoderS2BlockBegin_ = 0;
+        }
     }
 
     CATLASS_DEVICE
@@ -367,10 +444,11 @@ private:
         uint32_t n2Idx,
         uint32_t groupIdx,
         uint32_t s1BlockIdx,
+        uint32_t s2BlockIdx,
         FAGBlockInfo &block)
     {
         const uint32_t s1Start = s1BlockIdx * qBlockSize_;
-        const uint32_t s2Start = decoderS2BlockIdx_ * kvBlockSize_;
+        const uint32_t s2Start = s2BlockIdx * kvBlockSize_;
         const uint64_t totalS1Start =
             decoderQBatchStart_ + s1Start;
         const uint64_t totalS2Start =
@@ -383,7 +461,7 @@ private:
         block.n2Idx = n2Idx;
         block.groupIdx = groupIdx;
         block.s1BlockIdx = s1BlockIdx;
-        block.s2BlockIdx = decoderS2BlockIdx_;
+        block.s2BlockIdx = s2BlockIdx;
         block.s1Start = s1Start;
         block.s2Start = s2Start;
         block.curBatchS1 = decoderS1Length_;
@@ -425,7 +503,8 @@ private:
         }
         // ------------n2Idx------------
         const uint64_t blockNumPerN2 =
-            static_cast<uint64_t>(groupNum_) * decoderValidS1PerN2_;
+            static_cast<uint64_t>(groupNum_) *
+            (IS_DTM ? decoderValidS2PerN2_ : decoderValidS1PerN2_);
         const uint64_t blockInBatch =
             blockId - decoderBatchBlockBegin_;
         const uint32_t n2Idx =
@@ -433,8 +512,42 @@ private:
         const uint64_t blockInN2 = blockInBatch % blockNumPerN2;
         if (n2Idx != decoderN2Idx_) {
             decoderN2Idx_ = n2Idx;
-            decoderS2BlockIdx_ = 0;
-            decoderS2BlockBegin_ = 0;
+            if constexpr (IS_DTM) {
+                decoderS1BlockIdx_ = 0;
+                decoderS1BlockBegin_ = 0;
+            } else {
+                decoderS2BlockIdx_ = 0;
+                decoderS2BlockBegin_ = 0;
+            }
+        }
+        if constexpr (IS_DTM) {
+            // ------------s1Idx------------
+            uint32_t validS2Num = 0;
+            while (decoderS1BlockIdx_ < decoderS1BlockNum_) {
+                validS2Num = ValidS2BlockNum(
+                    decoderS1Length_, decoderS2Length_,
+                    decoderS1BlockIdx_);
+                const uint64_t s1BlockTasks =
+                    static_cast<uint64_t>(groupNum_) * validS2Num;
+                if (blockInN2 <
+                    decoderS1BlockBegin_ + s1BlockTasks) {
+                    break;
+                }
+                decoderS1BlockBegin_ += s1BlockTasks;
+                ++decoderS1BlockIdx_;
+            }
+            if (decoderS1BlockIdx_ >= decoderS1BlockNum_) {
+                return false;
+            }
+            // ------------gIdx & s2Idx------------
+            const uint64_t blockInS1 =
+                blockInN2 - decoderS1BlockBegin_;
+            const uint32_t groupIdx =
+                static_cast<uint32_t>(blockInS1 / validS2Num);
+            const uint32_t s2BlockIdx =
+                static_cast<uint32_t>(blockInS1 % validS2Num);
+            FillBlockInfo(blockId, n2Idx, groupIdx, decoderS1BlockIdx_, s2BlockIdx, block);
+            return true;
         }
         // ------------s2Idx------------
         uint32_t firstValidS1 = 0;
@@ -464,8 +577,7 @@ private:
         const uint32_t s1BlockIdx =
             firstValidS1 +
             static_cast<uint32_t>(blockInS2 % validS1Num);
-        FillBlockInfo(
-            blockId, n2Idx, groupIdx, s1BlockIdx, block);
+        FillBlockInfo(blockId, n2Idx, groupIdx, s1BlockIdx, decoderS2BlockIdx_, block);
         return true;
     }
 
@@ -858,6 +970,12 @@ private:
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
             SYNC_V2_TO_C34_FLAG);
     }
+    
+    CATLASS_DEVICE
+    void ProcessVecDTMStage()
+    {
+        
+    }
 #endif
 
 private:
@@ -887,6 +1005,13 @@ private:
     AscendC::GlobalTensor<float> dqWorkspaceGm_;
     AscendC::GlobalTensor<float> dkWorkspaceGm_;
     AscendC::GlobalTensor<float> dvWorkspaceGm_;
+    
+    AscendC::GlobalTensor<float> dqDetWorkspaceGm_;
+    AscendC::GlobalTensor<float> dkDetWorkspaceGm_;
+    AscendC::GlobalTensor<float> dvDetWorkspaceGm_;
+    
+    GM_ADDR detReadyCounter_ = nullptr;
+    GM_ADDR detDoneCounter_ = nullptr;
 
     AscendC::LocalTensor<DataType> l1PTensor[TASK_PINGPONG];
     AscendC::LocalTensor<DataType> l1dSTensor[TASK_PINGPONG];
@@ -946,6 +1071,9 @@ private:
     uint32_t decoderN2Idx_ = 0;
     uint32_t decoderS2BlockIdx_ = 0;
     uint64_t decoderS2BlockBegin_ = 0;
+    uint32_t decoderS1BlockIdx_ = 0;
+    uint64_t decoderS1BlockBegin_ = 0;
+    uint64_t decoderValidS2PerN2_ = 0;
 
     FAGBlockInfo previousBlock_{};
 };

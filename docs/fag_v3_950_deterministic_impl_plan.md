@@ -2,7 +2,8 @@
 
 > 目标分支：`integration/FAG-V3-A5`，目录 `csrc/ascend950/flash_attn_npu_3/`。
 > 设计来源：《TriDao FA-NPU A5 v3 反向确定性方案详设》+ 评审结论。
-> 本文档列出全部需要修改/新增的文件、代码位置和关键实现要点。
+> 本文档 §3 以一张进度总表列出全部需要修改/新增的文件及具体修改需求，
+> 每条修改需求独占一行，末列 ✅ = 已完成，🟥 = 未完成。
 
 ## 1. 背景
 
@@ -16,18 +17,20 @@ fixpipe 原子加，累加顺序由多核硬件仲裁决定，同一样本两次
 
 ## 2. 已定稿的关键决策
 
-### 2.1 任务枚举轴序
+### 2.1 任务枚举轴序（bn2s1gs2）
 
 - 非确定性（现状，不动）：`b → n2 → s2 → g → s1`（kv 外 q 内）
 - 确定性（新增分支）：**`b → n2 → s1 → g → s2`**（q 外 kv 内，s2 最内）
+
+> 注：详设文档初稿为 `b → n2 → g → s1 → s2`，评审后互换 g/s1 定为
+> `b → n2 → s1 → g → s2`，本 plan 全部按后者执行。
 
 约束来源：
 
 - `s2` 必须在 (g, s1) 之下最内层 —— 保证同一 dq tile（s1、head 固定）的贡献者
   blockId 连续，任一时刻最多 1 个未收尾 dq 块（dqPostAbsorb=1 的单 tile 缓冲区前提）；
 - `n2` 在 g、s1 之外 —— 每个 kv head 的 dk/dv 在自身 n2 段内收齐，accumList 生命周期最短；
-- `s1` 在 `g` 之外 —— 固定 s1 时 G 个 head 背靠背重扫同一份 K/V，L2 复用更好
-  （相比文档初稿的 n2→g→s1→s2 互换 g/s1 所得）。
+- `s1` 在 `g` 之外 —— 固定 s1 时 G 个 head 背靠背重扫同一份 K/V，L2 复用更好。
 
 head 关系：GQA 下 `h1 = n2 × G + g`；dq 按 q head 独立（跨 head 无累加），
 dk/dv 按 kv head 汇聚（同组 G 个 q head 的贡献全部累加到同一 kv head）。
@@ -53,6 +56,9 @@ host 侧决策的开关，仅影响 dq 的归约路径（det 槽三个梯度都�
 | dqWorkSpaceGm_ | `BLOCK_S1 × Dqk`（单 tile 滚动累加器） | `S1 × N1 × Dqk`（全量 fp32） |
 | dq 收尾 | VecDTM 内四分支（含 scale+cast 直写 dqGm） | 与 dk/dv 相同，入账后走 FagPost |
 | FagPost 范围 | 仅 dk/dv | dq/dk/dv |
+
+dqPostAbsorb=1 可行性的依据：轴序 bn2s1gs2 下 s2 最内，未收尾 dq 块任一时刻最多 1 个，
+故 `BLOCK_S1 × Dqk` 容量足够（详设文档 §WorkSpace 说明）。
 
 dq 四分支（按本组 accumList 是否含首块 s2Idx==0 / 尾块 s2Idx==lastValidS2(s1)）：
 
@@ -83,10 +89,11 @@ AIV 按 tiling 下发的 `dqVecNum/dkVecNum/dvVecNum` 分段：核号
 超出总和的 AIV 跳过 VecDTM（V12 主流水照跑）。
 
 候选组合（AIV=56，按 (dq, dk, dv)）：`16+16+16` / `16+16+24` / `18+18+20`。
-dqPostAbsorb=1 时 dq 组负载最重（合并+scale+cast+写输出），建议 16+16+24。
+dqPostAbsorb=1 时 dq 组负载最重（合并+scale+cast+写输出），v1 统一定为 **16+16+16**，后续可据实测调整。
 
 组内行均分：`ceil(128 / 组内核数)` 分段，末核为空直接跳过（沿用
-`FagPost::ProcessRegion` 的 perCore/rangeBegin 模式）。
+`FagPost::ProcessRegion` 的 perCore/rangeBegin 模式）。同一组同一行段同一时刻
+只有一个 Vector 核处理，组内不需要任何原子操作。
 
 ### 2.6 轮次末同步（信号量）
 
@@ -114,135 +121,53 @@ dqPostAbsorb=1 时 dq 组负载最重（合并+scale+cast+写输出），建议 
 readyCounter 目标为各轮参与核数的**累计和**（单调免复位）。
 轮询须用绕 cache 的原子/易变读（910 `MUL_CORE_SYNC_BUFFER` 同款机制）。
 
-## 3. 文件改动清单
+## 3. 文件修改进度总表
 
-### 3.1 `fag_common.h`（改）— tiling ABI
+> 行序 = 实施顺序；末列 ✅ = 已完成，🟥 = 未完成。
 
-`FAGInfo`（现 `:37-58`）新增：
+| # | 文件 | 具体修改需求 | 状态 |
+|---|---|---|---|
+| 1 | `fag_common.h` | `FAGInfo`/`FAGTilingData` 已含 `deterministic`、`dqPostAbsorb`、`dqVecNum/dkVecNum/dvVecNum`、`dq/dk/dvDetOffset`（:40-41、:55-57、:67-69、:97-99） | ✅ |
+| 2 | `fag_common.h` | `FAGBlockInfo`（:103-129）不变；同步区固定放 workspace 起始（`syncOffset=0`，不下发字段） | ✅ |
+| 3 | `fag_common.h` | 与 fag_tiling.cpp 透传逻辑联调核对 | ✅ |
+| 4 | `fag_tiling.cpp` | 改写布局计算（:56-65，现为 `dqOffset=0` 起排、无同步区/无 det 三段）：`dqOffset = MULTI_CORE_SYNC_BYTES(64KB)`，布局 `[sync][dq][dk][dv][delta][dqDet][dkDet][dvDet]`，行步长按 `RoundUp(headDim, 8)` 对齐 | ✅ |
+| 5 | `fag_tiling.cpp` | dq 累加区随 dqPostAbsorb 分档：=1 为 `qTile×dAlign`，=0 为 `totalQ×qHeadNum×dAlign` | ✅ |
+| 6 | `fag_tiling.cpp` | det 三段 = `aicNum × continuousBlockNum × tile`（紧凑行主序）；`deterministic=0` 时不追加（workspaceSize 在 delta 截止） | ✅ |
+| 7 | `fag_tiling.cpp` | 透传 `dqPostAbsorb/dqVecNum/dkVecNum/dvVecNum`（现仅透传 `deterministic`，:32） | ✅ |
+| 8 | `mha_bwd.cpp` | `fag_info.deterministic` 接入（:128） | ✅ |
+| 9 | `mha_bwd.cpp` | dispatch 宏按 deterministic 分流模板参（:265/:279）；workspace 分配跟随 `workspaceSize`，不改 | ✅ |
+| 10 | `mha_bwd.cpp` | :128 附近填 `fag_info.dqPostAbsorb` 和三个 Vec 组核数（已固定 `dqPostAbsorb=1` + `16+16+16`（mha_bwd.cpp :129-136），后续换启发式） | ✅ |
+| 11 | `mha_bwd.cpp` | workspace 对齐检查补 det 三段偏移 | ✅ |
+| 12 | `fag_epilogue_pre.hpp` | dqPostAbsorb=1 时跳过 dq 全量区清零（单 tile 由 dq 分支③覆盖写） | 🟥 |
+| 13 | `fag_epilogue_pre.hpp` | 新增清零 `readyCounter/doneCounter`（0 号 AIV 负责） | 🟥 |
+| 14 | `fag_epilogue_pre.hpp` | det 槽不清零（VecDTM 只读有效行 s1Extend/s2Extend） | 🟥 |
+| 15 | `fag_kernel.cpp` | 模板参 `IS_DTM` 已存在（:64） | ✅ |
+| 16 | `fag_kernel.cpp` | `Init`：IS_DTM 时新增 `dq/dk/dvDetWorkspaceGm_` 三个 GlobalTensor + 同步计数器地址 | ✅ |
+| 17 | `fag_kernel.cpp` | :302 附近新增 `LastValidS2Block(s1BlockIdx)`（`FirstValidS1Block` 镜像）与 `CountValidS2Blocks`（按 s1 累加 validS2 数） | ✅ |
+| 18 | `fag_kernel.cpp` | `LoadDecoderBatch`（:344-362）：IS_DTM 分支改算 per-s1 统计，batch 段长公式不变 | ✅ |
+| 19 | `fag_kernel.cpp` | `DecodeBlock`（:410-470）：IS_DTM 分支轴序改 bn2s1gs2——③变长扫描定 **s1**（游标换 `decoderS1BlockIdx_`，段长 = G × validS2Num(s1)）；④ `g = blockInS1 / validS2Num`，`s2 = blockInS1 % validS2Num` | ✅ |
+| 20 | `fag_kernel.cpp` | :947 游标成员换 s1 版本 | ✅ |
+| 21 | `fag_kernel.cpp` | `ProcessC5Stage/C34Stage`（:627-687）：写目标改 det 槽（紧凑布局），`enAtomic=false`；轮 r>0 首次写槽前轮询 doneCounter 放行；本轮最后任务写完后 `WaitFlag<FIX_M>` + readyCounter+1 | 🟥 |
+| 22 | `fag_kernel.cpp` | `RunTasks`（:473-544）+ drain（:500-511）：`issueLane == continuousBlockNum_-1` 时 Cube 发 ready、Vec 调 `ProcessVecDTM(issueRound)`，drain 补最后一轮 | 🟥 |
+| 23 | `fag_kernel.cpp` | 新增 `DecodeBlockCold(blockId)` 无状态冷解码，供 VecDTM 重建轮次任务清单；反解 `coreIdx = (blockId % waveSize) / cbn`，`lane = blockId % cbn` | 🟥 |
+| 24 | `fag_kernel.cpp` | 轮末同步：v1 用 `SyncAll<false>()`，v2 换 ready/done 计数器协议 | 🟥 |
+| 25 | `fag_epilogue_deterministic_add.hpp` | 新建 VecDTM 本体（当前为空文件占位）：结构对齐现有 epilogue（`Init(resource, workspace, tiling)` + `operator()(vectorBlockIdx, round, ...)`） | 🟥 |
+| 26 | `fag_epilogue_deterministic_add.hpp` | Vec 三分组：`vectorBlockIdx < dqVecNum` → dq；`< +dkVecNum` → dk；余 → dv；超出总和的 AIV 跳过 | 🟥 |
+| 27 | `fag_epilogue_deterministic_add.hpp` | dk/dv 组：本轮本组每块按 accumList（blockId 升序）组内 Add 合并 → `SetAtomicType<float>` + DataCopyPad 入账 | 🟥 |
+| 28 | `fag_epilogue_deterministic_add.hpp` | dq 组：组内合并 → existFirst/existLast 四分支收尾（§2.3，含 Muls/Cast 直写 dqGm） | 🟥 |
+| 29 | `fag_epilogue_deterministic_add.hpp` | UB 按 tileElements 分块流式处理；行均分沿用 FagPost 的 ceil 分段模式 | 🟥 |
+| 30 | `fag_epilogue_deterministic_add.hpp` | 收尾每组 doneCounter+1 | 🟥 |
+| 31 | `fag_epilogue_post.hpp` | :65-67 加分支：`!(deterministic && dqPostAbsorb)` 时才对 dq 走 `ProcessRegion<true>`（否则 dq 已在 VecDTM 直写 dqGm）；FagPost 范围仅 dk/dv | 🟥 |
+| 32 | `fag_mmad_dqkv.hpp` | 不改：`FixpipeTla` 已支持 `enAtomic=false` 普通覆盖写；GM 目标由调用方 tla tensor 传入 | ✅ |
+| 33 | `tests/test_flash_attn_npu_v3_bwd.py` | 解除确定性用例 `skipif`（:206、:248、:291、:337 逐个评估） | 🟥 |
+| 34 | `tests/test_flash_attn_npu_v3_bwd.py` | 新增 bit-exact 用例：同输入连跑两次，`torch.equal` 校验 dq/dk/dv 逐 bit 一致 | 🟥 |
+| 35 | `tests/test_flash_attn_npu_v3_bwd.py` | 精度对照走现有 `npu_precision_utils` 容差框架 | 🟥 |
+| 36 | `tests/test_flash_attn_npu_v3_bwd.py` | 覆盖：MHA（G=1）、GQA（G>1）、causal/非 causal、TND/BSND、尾块 | 🟥 |
 
-```cpp
-uint32_t dqPostAbsorb = 0;                 // host 决策
-uint32_t dqVecNum = 0, dkVecNum = 0, dvVecNum = 0;  // Vec 三分组
-```
-
-`FAGTilingData`（现 `:60-92`）新增：
-
-```cpp
-uint32_t dqPostAbsorb = 0;                 // 可复用 reserved0（:68）
-uint32_t dqVecNum = 0, dkVecNum = 0, dvVecNum = 0;
-uint64_t dqDetOffset = 0, dkDetOffset = 0, dvDetOffset = 0;  // det 三段偏移
-```
-
-`FAGBlockInfo`（现 `:103-129`）不变。同步区固定放 workspace 起始（`syncOffset=0`，不下发字段）。
-
-### 3.2 `fag_tiling.cpp`（改）— workspace 布局
-
-改写现 `:55-64` 的布局计算：
-
-```cpp
-const uint64_t dAlign  = RoundUp(qkHeadDim, 8);   // fp32 32B 对齐
-const uint64_t dvAlign = RoundUp(vHeadDim, 8);
-// dq 累加区大小随 dqPostAbsorb
-dqWsSize = dqPostAbsorb ? AlignUp(qTile × dAlign × 4B)
-                        : AlignUp(totalQ × qHeadNum × dAlign × 4B);
-// det 槽：aicNum × continuousBlockNum × tile（紧凑行主序，行步长 dAlign）
-dqDetSize = AlignUp(aicNum × cbn × qTile  × dAlign  × 4B, GM_ALIGNMENT);
-dkDetSize = AlignUp(aicNum × cbn × kvTile × dAlign  × 4B, GM_ALIGNMENT);
-dvDetSize = AlignUp(aicNum × cbn × kvTile × dvAlign × 4B, GM_ALIGNMENT);
-
-// 布局：[sync 64KB][dq][dk][dv][delta][dqDet][dkDet][dvDet]
-dqOffset    = MULTI_CORE_SYNC_BYTES;
-dkOffset    = dqOffset + dqWsSize;
-dvOffset    = dkOffset + dkWsSize;
-deltaOffset = dvOffset + dvWsSize;
-// deterministic=1 时追加 det 三段；=0 时不追加（workspaceSize 在 delta 截止）
-```
-
-同时透传 `dqPostAbsorb/dqVecNum/dkVecNum/dvVecNum`。
-
-### 3.3 `mha_bwd.cpp`（改）— host 决策
-
-- `:128` 附近：填 `fag_info.dqPostAbsorb` 和三个 Vec 组核数（v1 可固定
-  `dqPostAbsorb=1` + `16+16+24`，后续换启发式）；
-- `:214-216`：对齐检查补上 det 三段偏移；
-- workspace 分配（`:208-219`）跟随 `workspaceSize`，**不改**；dispatch 宏已透
-  deterministic 模板参，**不改**。
-
-### 3.4 `fag_epilogue_pre.hpp`（改）— 清零
-
-- dqPostAbsorb=1 时跳过 dq 全量区清零（单 tile 由分支③覆盖写）；
-- 新增：清零 `readyCounter/doneCounter`（0 号 AIV 负责）；
-- det 槽不清零（VecDTM 只读有效行 s1Extend/s2Extend）。
-
-### 3.5 `fag_kernel.cpp`（改）— 核心
-
-| 位置 | 改动 |
-|---|---|
-| `Init`（`:96-101` 后） | IS_DTM 时新增 `dq/dk/dvDetWorkspaceGm_` 三个 GlobalTensor + 同步计数器地址 |
-| `:302-323` | 新增 `LastValidS2Block(s1BlockIdx)`（FirstValidS1Block 的镜像） |
-| `:325-341` | 新增 `CountValidS2Blocks`（按 s1 累加 validS2 数） |
-| `LoadDecoderBatch`（`:344-362`） | IS_DTM 分支改算 per-s1 统计；batch 段长公式不变（有效对数相同） |
-| `DecodeBlock`（`:410-470`） | IS_DTM 分支：①②段不动；③变长线性扫描定 **s1**（游标换 `decoderS1BlockIdx_/S1BlockBegin_`，段长 = G × validS2Num(s1)）；④ `g = blockInS1 / validS2Num`，`s2 = blockInS1 % validS2Num`（0 起，无偏移） |
-| `:946-948` | 游标成员换成 s1 版本 |
-| `ProcessC5Stage/C34Stage`（`:627-687`） | IS_DTM 分支：写目标改 det 槽（紧凑布局），`enAtomic=false`；轮 r>0 首次写槽前轮询放行（doneCounter）；本轮最后任务写完后 `WaitFlag<FIX_M>` + readyCounter+1 |
-| `RunTasks`（`:524-544`） | Vec 侧在 `ProcessV2Stage(previousBlock_)` 后，若 `previousBlock_.issueLane == continuousBlockNum_-1` → 调 `ProcessVecDTM(issueRound)`；Cube 侧同样条件发 ready |
-| drain（`:500-511`） | 补最后一轮的 ready + VecDTM |
-| 新增 | `DecodeBlockCold(blockId)` 无状态冷解码，供 VecDTM 重建轮次任务清单（O(batch) 可接受） |
-
-任务来源反解（VecDTM 用）：
-`coreIdx = (blockId % waveSize) / continuousBlockNum`，`lane = blockId % continuousBlockNum`。
-
-### 3.6 `fag_epilogue_deterministic_add.hpp`（新增）— VecDTM 本体
-
-结构对齐现有 epilogue（`Init(resource, workspace, tiling)` +
-`operator()(vectorBlockIdx, round, ...)`）：
-
-```
-分组: vectorBlockIdx < dqVecNum → dq; < +dkVecNum → dk; 余 → dv
-dk/dv 组: 对本轮本组每个 dk/dv 块: accumList 按 blockId 升序合并 → atomic add 入账
-dq 组:    对本轮本组每个 dq 块: 组内合并 → existFirst/existLast 四分支（§2.3）
-收尾: 每组 doneCounter + 1
-```
-
-UB 按 tileElements 分块流式处理；行均分沿用 FagPost 的 ceil 分段模式。
-
-### 3.7 `fag_epilogue_post.hpp`（改）— dq 分支
-
-`:65-67` 处：
-
-```cpp
-if (!(tiling_->deterministic && tiling_->dqPostAbsorb)) {
-    ProcessRegion<true>(dqGm_, dqWorkspace_, dqCount, ...);  // 否则 dq 已在 VecDTM 写完
-}
-```
-
-### 3.8 `fag_mmad_dqkv.hpp`（不改）
-
-`FixpipeTla`（`:400-434`）已支持 `enAtomic=false` 普通覆盖写；GM 目标由调用方
-tla tensor 传入，无需改动。
-
-### 3.9 `tests/test_flash_attn_npu_v3_bwd.py`（改）
-
-- 解除确定性用例的 `skipif`；
-- 新增 bit-exact 用例：同输入连跑两次，`torch.equal` 校验 dq/dk/dv 逐 bit 一致；
-- 精度对照走现有 `npu_precision_utils` 容差框架；
-- 覆盖形状：MHA（G=1）、GQA（G>1）、causal/非 causal、TND/BSND、尾块。
-
-## 4. 实施顺序
-
-| 步 | 内容 | 依赖 |
-|---|---|---|
-| 1 | fag_common.h + fag_tiling.cpp + mha_bwd.cpp（ABI 与布局） | — |
-| 2 | fag_kernel.cpp 解码器轴序（IS_DTM 分支） | 1 |
-| 3 | C345/C5 分槽写 + v1 SyncAll 轮次同步 | 2 |
-| 4 | fag_epilogue_deterministic_add.hpp（VecDTM）+ pre/post 改动 | 3 |
-| 5 | 测试：bit-exact + 精度 | 4 |
-| 6 | v2：SyncAll 换 ready/done 计数器（VecDTM 与下一轮 C12 重叠） | 5 |
-
-## 5. 开放项（TBD）
+## 4. 开放项（TBD）
 
 - dqPostAbsorb 的启发式启用条件（v1 固定 =1）；
-- Vec 分组组合的选择策略（v1 固定 16+16+24）；
+- Vec 分组组合的选择策略（v1 已固定 16+16+16）；
 - VecDTM 耗时预算：须 < （cube 周期 − V12 周期）× continuousBlockNum，
   否则挤压主流水 —— 实测后决定是否降为每两轮吸收一次；
 - g/s1 轴序（已定 n2→s1→g→s2）与 L2 复用的实测对比。

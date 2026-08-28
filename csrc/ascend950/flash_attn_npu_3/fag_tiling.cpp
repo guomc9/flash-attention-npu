@@ -13,6 +13,12 @@ namespace FAGTiling950 {
 namespace {
 
 constexpr uint64_t FP32_BYTES = sizeof(float);
+constexpr uint64_t FP32_ROW_ALIGN = 8;  // 32B alignment in float elements
+
+uint64_t RoundUpU64(uint64_t value, uint64_t align)
+{
+    return (value + align - 1) / align * align;
+}
 
 }  // namespace
 
@@ -53,16 +59,60 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
 
     tiling.usedCoreNum = info.aicNum; // TODO: 是否需要和实际task取min
 
-    uint64_t dqWsSize = tiling.totalQ * tiling.qHeadNum * tiling.qkHeadDim * FP32_BYTES;
-    uint64_t dkWsSize = tiling.totalKv * tiling.kvHeadNum * tiling.qkHeadDim * FP32_BYTES;
-    uint64_t dvWsSize = tiling.totalKv * tiling.kvHeadNum * tiling.vHeadDim * FP32_BYTES;
-    uint64_t deltaWsSize = tiling.totalQ * tiling.qHeadNum * 8;
+    // Deterministic knobs are only meaningful when the deterministic path is
+    // enabled; keep them zeroed otherwise so the legacy layout is untouched.
+    tiling.dqPostAbsorb = info.deterministic ? info.dqPostAbsorb : 0;
+    tiling.dqVecNum = info.deterministic ? info.dqVecNum : 0;
+    tiling.dkVecNum = info.deterministic ? info.dkVecNum : 0;
+    tiling.dvVecNum = info.deterministic ? info.dvVecNum : 0;
 
-    tiling.dqOffset = 0;
-    tiling.dkOffset = tiling.dqOffset + dqWsSize;
-    tiling.dvOffset = tiling.dkOffset + dkWsSize;
-    tiling.deltaOffset = tiling.dvOffset + dvWsSize;
-    tiling.workspaceSize = tiling.deltaOffset + deltaWsSize;
+    const uint64_t dAlign = RoundUpU64(info.qkHeadDim, FP32_ROW_ALIGN);
+    const uint64_t dvAlign = RoundUpU64(info.vHeadDim, FP32_ROW_ALIGN);
+
+    if (!info.deterministic) {
+        // Legacy layout, byte-identical to the non-deterministic path.
+        uint64_t dqWsSize = tiling.totalQ * tiling.qHeadNum * tiling.qkHeadDim * FP32_BYTES;
+        uint64_t dkWsSize = tiling.totalKv * tiling.kvHeadNum * tiling.qkHeadDim * FP32_BYTES;
+        uint64_t dvWsSize = tiling.totalKv * tiling.kvHeadNum * tiling.vHeadDim * FP32_BYTES;
+        uint64_t deltaWsSize = tiling.totalQ * tiling.qHeadNum * 8;
+
+        tiling.dqOffset = 0;
+        tiling.dkOffset = tiling.dqOffset + dqWsSize;
+        tiling.dvOffset = tiling.dkOffset + dkWsSize;
+        tiling.deltaOffset = tiling.dvOffset + dvWsSize;
+        tiling.workspaceSize = tiling.deltaOffset + deltaWsSize;
+        return 0;
+    }
+
+    // Deterministic layout:
+    //   [sync 64KB][dq][dk][dv][delta][dqDet][dkDet][dvDet]
+    // dq accumulates into a single rolling tile when dqPostAbsorb=1, into the
+    // full S1*N1 region otherwise.  det slots: aicNum * continuousBlockNum
+    // tiles per gradient, compact row-major with an aligned row stride.
+    const uint64_t dqWsSize = tiling.dqPostAbsorb
+        ? static_cast<uint64_t>(tiling.qTile) * dAlign * FP32_BYTES
+        : tiling.totalQ * tiling.qHeadNum * dAlign * FP32_BYTES;
+    const uint64_t dkWsSize = tiling.totalKv * tiling.kvHeadNum * dAlign * FP32_BYTES;
+    const uint64_t dvWsSize = tiling.totalKv * tiling.kvHeadNum * dvAlign * FP32_BYTES;
+    const uint64_t deltaWsSize = tiling.totalQ * tiling.qHeadNum * 8;
+
+    const uint64_t slotNum =
+        static_cast<uint64_t>(info.aicNum) * info.continuousBlockNum;
+    const uint64_t dqDetSize = RoundUpU64(
+        slotNum * tiling.qTile * dAlign * FP32_BYTES, GM_ALIGNMENT);
+    const uint64_t dkDetSize = RoundUpU64(
+        slotNum * tiling.kvTile * dAlign * FP32_BYTES, GM_ALIGNMENT);
+    const uint64_t dvDetSize = RoundUpU64(
+        slotNum * tiling.kvTile * dvAlign * FP32_BYTES, GM_ALIGNMENT);
+
+    tiling.dqOffset = MULTI_CORE_SYNC_BYTES;
+    tiling.dkOffset = tiling.dqOffset + RoundUpU64(dqWsSize, GM_ALIGNMENT);
+    tiling.dvOffset = tiling.dkOffset + RoundUpU64(dkWsSize, GM_ALIGNMENT);
+    tiling.deltaOffset = tiling.dvOffset + RoundUpU64(dvWsSize, GM_ALIGNMENT);
+    tiling.dqDetOffset = tiling.deltaOffset + RoundUpU64(deltaWsSize, GM_ALIGNMENT);
+    tiling.dkDetOffset = tiling.dqDetOffset + dqDetSize;
+    tiling.dvDetOffset = tiling.dkDetOffset + dkDetSize;
+    tiling.workspaceSize = tiling.dvDetOffset + dvDetSize;
     return 0;
 }
 

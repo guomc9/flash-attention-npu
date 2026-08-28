@@ -126,6 +126,14 @@ mha_bwd(
     fag_info.maskType = is_causal ? FAGTiling950::MaskType::CAUSAL
                                   : FAGTiling950::MaskType::NO_MASK;
     fag_info.deterministic = deterministic ? 1U : 0U;
+    // Deterministic v1: dq always post-absorbed by VecDTM; Vec cores split
+    // into three fixed groups of 16 (dq/dk/dv). Heuristics are TBD.
+    fag_info.dqPostAbsorb = deterministic ? 1U : 0U;
+    if (deterministic) {
+        fag_info.dqVecNum = 16;
+        fag_info.dkVecNum = 16;
+        fag_info.dvVecNum = 16;
+    }
     fag_info.batch = batch_size;
     fag_info.qSeqlen = q_seqlen;
     fag_info.qHeadNum = num_heads;
@@ -214,6 +222,15 @@ mha_bwd(
     TORCH_CHECK(workspace_size % sizeof(float) == 0 &&
                     fag_tiling_data.deltaOffset % sizeof(float) == 0,
                 "Ascend950 v3 bwd: FP32 workspace offsets must be aligned");
+    if (deterministic) {
+        TORCH_CHECK(
+            fag_tiling_data.dqDetOffset % FAGTiling950::GM_ALIGNMENT == 0 &&
+                fag_tiling_data.dkDetOffset % FAGTiling950::GM_ALIGNMENT == 0 &&
+                fag_tiling_data.dvDetOffset % FAGTiling950::GM_ALIGNMENT == 0 &&
+                fag_tiling_data.dvDetOffset < workspace_size,
+            "Ascend950 v3 bwd: deterministic det workspace offsets must be "
+            "512B-aligned and inside the workspace");
+    }
     at::Tensor workspace = at::empty(
         {static_cast<int64_t>(workspace_size / sizeof(float))},
         at::device(at::kPrivateUse1).dtype(at::kFloat));
