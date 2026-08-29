@@ -150,11 +150,11 @@ readyCounter 目标为各轮参与核数的**累计和**（单调免复位）。
 | 19 | `fag_kernel.cpp` | `DecodeBlock`（:410-470）：IS_DTM 分支轴序改 bn2s1gs2——③变长扫描定 **s1**（游标换 `decoderS1BlockIdx_`，段长 = G × validS2Num(s1)）；④ `g = blockInS1 / validS2Num`，`s2 = blockInS1 % validS2Num` | ✅ |
 | 20 | `fag_kernel.cpp` | :947 游标成员换 s1 版本 | ✅ |
 | 21 | `fag_kernel.cpp` | `ProcessC5Stage/C34Stage` IS_DTM 分支：写目标改 det 槽（紧凑布局），`enAtomic=false`；槽索引 = `blockId % waveSize_`（= coreIdx×cbn+issueLane）；槽步长/行步长用 `RoundUp(headDim,8)`（`dq/dk/dvDetSlotElems_`），与 tiling 的 det 段大小一致；全部包在 `if constexpr (IS_DTM)` 内，非 det 路径不动 | ✅ |
-| 22 | `fag_kernel.cpp` | `RunTasks` IS_DTM 分支：轮末 flush 本轮最后任务的 C5/C34/V1/V2；`pendingBackend` 显式跟踪上一任务后端是否已消费（防轮边界重复 flush）；`Init` 内 device 端预扫描 `totalBlockNum_/totalRounds_`（逐 batch `CountValidS2Blocks`），保证所有核参与相同轮数的 barrier；非 det 路径保持原流水 | ✅ |
-| 23 | `fag_kernel.cpp` | 新增 `DecodeBlockCold(blockId)` 无状态冷解码，供 VecDTM 重建轮次任务清单；反解 `coreIdx = (blockId % waveSize) / cbn`，`lane = blockId % cbn` | 🟥 |
+| 22 | `fag_kernel.cpp` | `RunTasks` IS_DTM 分支：轮末 flush 本轮最后任务的 C5/C34/V1/V2，末轮 `returnL1=false`（无后续任务，L1 不归还，与非 det drain 一致）；轮内 deferred 条件简化为 `issueLane != 0` + 轮局部 `roundHasTask`，无跨轮状态；`Init` 内 device 端预扫描 `totalBlockNum_/totalRounds_`（逐 batch `CountValidS2Blocks`），保证所有核参与相同轮数的 barrier；非 det 路径保持原流水 | ✅ |
+| 23 | `fag_epilogue_deterministic_add.hpp` | 无状态解码辅助（`fag_det` 命名空间自由函数，**模板已生成**）：`GetBatchShape/ValidS2BlockNum/LastValidS2Block/CountValidS2Blocks` + `DecodeBlockById(blockId, out)`（按 blockId 从零重建任务坐标，与流式 `DecodeBlock` 命名相对）；kernel 侧同名成员后续可委托共享版本去重；TND 经 `DecodeParams.cuSeqQ/cuSeqKv` 读累积长度 | 🟥 |
 | 24 | `fag_kernel.cpp` | **v1 轮末同步**：轮次末 `AscendC::SyncAll<false>()` 全核同步 → `ProcessVecDTM` 定序累加 → 再一次 SyncAll 放行；按 `totalRounds_` 走满所有轮（无任务的核也参与 barrier），末轮后 WaitCube/VecEvents 收尾退出 | ✅ |
 | 25 | `fag_kernel.cpp` | **v2 流水重叠**：SyncAll 换 ready/done GM 计数器协议（§2.6），cube 写完本轮 det 槽 + `WaitFlag<FIX_M>` 后 readyCounter+1 直接进发下一轮 C12；VecDTM 与下一轮 C12 重叠；写槽前轮询 doneCounter 放行。依赖 v1 测试全绿后再做 | 🟥 |
-| 26 | `fag_epilogue_deterministic_add.hpp` | 新建 VecDTM 本体（当前为空文件占位）：结构对齐现有 epilogue（`Init(resource, workspace, tiling)` + `operator()(vectorBlockIdx, round, ...)`） | 🟥 |
+| 26 | `fag_epilogue_deterministic_add.hpp` | VecDTM 本体为 `Catlass::Epilogue::Block::FagDeterministicAdd`（**模板已生成**：`Init(resource, dq, cuSeqQ, cuSeqKv, workspace, tiling)` + `operator()(vectorBlockIdx, issueRound, totalBlockNum)`，分组/行段/轮范围已就绪）；kernel 持有成员并在轮末两次 SyncAll 之间调用，`fag_kernel.cpp` 补 include 与成员声明，删除现有空调壳 `ProcessVecDTMStage` | 🟥 |
 | 27 | `fag_epilogue_deterministic_add.hpp` | Vec 三分组：`vectorBlockIdx < dqVecNum` → dq；`< +dkVecNum` → dk；余 → dv；超出总和的 AIV 跳过 | 🟥 |
 | 28 | `fag_epilogue_deterministic_add.hpp` | dk/dv 组：本轮本组每块按 accumList（blockId 升序）组内 Add 合并 → `SetAtomicType<float>` + DataCopyPad 入账 | 🟥 |
 | 29 | `fag_epilogue_deterministic_add.hpp` | dq 组：组内合并 → existFirst/existLast 四分支收尾（§2.3，含 Muls/Cast 直写 dqGm） | 🟥 |

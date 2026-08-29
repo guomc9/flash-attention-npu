@@ -628,15 +628,16 @@ private:
         SetVecEvents();
 #endif
         uint64_t taskId = 0;
-        // IS_DTM only: previousBlock_'s back-end (C5/C34/V1/V2) has not been
-        // processed yet.  Tracked explicitly because the round-end flush
-        // consumes it outside the usual "next task issues" trigger.
-        bool pendingBackend = false;
         for (uint32_t issueRound = 0;; ++issueRound) {
             const uint64_t blockBegin =
                 static_cast<uint64_t>(issueRound) * waveSize_ +
                 static_cast<uint64_t>(coreIdx) * continuousBlockNum_;
 
+            // IS_DTM: whether this core issued any task in this round.
+            // Round-local by construction: the round-end flush below consumes
+            // the last task's back-end, so the deferred in-loop processing
+            // only triggers for lanes > 0 and no cross-round state is kept.
+            [[maybe_unused]] bool roundHasTask = false;
             for (uint32_t issueLane = 0;
                  issueLane < continuousBlockNum_; ++issueLane) {
                 FAGBlockInfo block{};
@@ -649,8 +650,6 @@ private:
                         break;
                     } else {
                         if (taskId != 0) {
-                            // Drain the last task. There is no following task, so
-                            // its L1 buffers do not need to be returned.
 #ifdef __DAV_CUBE__
                             ProcessC5Stage(previousBlock_, false, mm345);
                             ProcessC34Stage(previousBlock_, false, mm345);
@@ -673,8 +672,12 @@ private:
                 block.issueRound = issueRound;
                 block.issueLane = issueLane;
 
+                // IS_DTM: at lane 0 previousBlock_ is the previous round's
+                // last task, whose back-end was already flushed at that
+                // round's end; lanes > 0 always have a pending same-round
+                // predecessor.
                 const bool hasPendingPrev =
-                    IS_DTM ? pendingBackend : (taskId != 0);
+                    IS_DTM ? (issueLane != 0) : (taskId != 0);
 #ifdef __DAV_CUBE__
                 // Front-end MM of task i overlaps the vector and back-end MM
                 // stages of task i - 1.
@@ -694,29 +697,32 @@ private:
 
                 previousBlock_ = block;
                 ++taskId;
-                pendingBackend = true;
+                roundHasTask = true;
             }
 
             if constexpr (IS_DTM) {
                 // v1: flush this round's last back-end task, then
                 // barrier -> VecDTM fixed-order reduction -> barrier.
-                if (pendingBackend) {
+                const bool moreRounds = issueRound + 1 < totalRounds_;
+                if (roundHasTask) {
+                    // The final round has no following task, so its L1
+                    // buffers do not need to be returned (same as the
+                    // non-DTM drain path).
 #ifdef __DAV_CUBE__
-                    ProcessC5Stage(previousBlock_, true, mm345);
-                    ProcessC34Stage(previousBlock_, true, mm345);
+                    ProcessC5Stage(previousBlock_, moreRounds, mm345);
+                    ProcessC34Stage(previousBlock_, moreRounds, mm345);
 #endif
 #ifdef __DAV_VEC__
                     ProcessV1Stage(previousBlock_, subBlockIdx);
                     ProcessV2Stage(previousBlock_, subBlockIdx);
 #endif
-                    pendingBackend = false;
                 }
                 AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
                 ProcessVecDTMStage();
 #endif
                 AscendC::SyncAll<false>();
-                if (issueRound + 1 >= totalRounds_) {
+                if (!moreRounds) {
 #ifdef __DAV_CUBE__
                     WaitCubeEvents();
 #endif
@@ -1071,7 +1077,7 @@ private:
     CATLASS_DEVICE
     void ProcessVecDTMStage()
     {
-
+        
     }
 #endif
 
