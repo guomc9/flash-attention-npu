@@ -57,6 +57,12 @@ struct BatchShape {
     uint32_t s2Len = 0;
 };
 
+struct KvEntry {
+    uint32_t n2Idx = 0;
+    uint32_t s2BlockIdx = 0;
+    uint32_t s2Extend = 0;
+};
+
 CATLASS_DEVICE inline BatchShape GetBatchShape(
     const DecodeParams &p, uint32_t batchIdx)
 {
@@ -328,27 +334,27 @@ public:
         }
 
         // ---- 3. this round's blockId range ----
-        const uint64_t roundBegin =
+        const uint64_t blockBegin =
             static_cast<uint64_t>(issueRound) * waveSize_;
-        uint64_t roundEnd = roundBegin + waveSize_;
-        if (roundEnd > totalBlockNum) {
-            roundEnd = totalBlockNum;
+        uint64_t blockEnd = blockBegin + waveSize_;
+        if (blockEnd > totalBlockNum) {
+            blockEnd = totalBlockNum;
         }
-        if (roundBegin >= roundEnd) {
+        if (blockBegin >= blockEnd) {
             return;
         }
 
         // ---- 4. per-group reduction ----
         if (group == Group::DQ) {
-            ProcessDq(rowBegin, rowEnd, roundBegin, roundEnd);
+            ProcessDq(rowBegin, rowEnd, blockBegin, blockEnd);
         } else if (group == Group::DK) {
-            ProcessKv(dkDetWorkspaceGm_, dkWorkspace_, dkDetSlotElems_,
+            ProcessDkv(dkDetWorkspaceGm_, dkWorkspace_, dkDetSlotElems_,
                 qkDimAlign_, tiling_->qkHeadDim,
-                rowBegin, rowEnd, roundBegin, roundEnd);
+                rowBegin, rowEnd, blockBegin, blockEnd);
         } else {
-            ProcessKv(dvDetWorkspaceGm_, dvWorkspace_, dvDetSlotElems_,
+            ProcessDkv(dvDetWorkspaceGm_, dvWorkspace_, dvDetSlotElems_,
                 dvDimAlign_, tiling_->vHeadDim,
-                rowBegin, rowEnd, roundBegin, roundEnd);
+                rowBegin, rowEnd, blockBegin, blockEnd);
         }
     }
 
@@ -359,7 +365,7 @@ private:
 
     // dk/dv shared path.  For every (n2, s2BlockIdx) block touched by this
     // round:
-    //   1. collect its accumList: blockIds in [roundBegin, roundEnd) whose
+    //   1. collect its accumList: blockIds in [blockBegin, blockEnd) whose
     //      DecodeBlockById matches the key, ascending (scanning blockId in
     //      order gives the fixed merge order for free);
     //   2. acc = slot(accumList[0]) rows [rowBegin,rowEnd); for each further
@@ -372,7 +378,7 @@ private:
     // Note: contributors of one (n2,s2) key are NOT consecutive under
     // bn2s1gs2 (s1 outer, g inner); buffer the round's (key, slotId) pairs
     // (at most waveSize entries) and group them in a second pass.
-    CATLASS_DEVICE void ProcessKv(
+    CATLASS_DEVICE void ProcessDkv(
         AscendC::GlobalTensor<float> &detGm,
         AscendC::GlobalTensor<float> &wsGm,
         uint64_t slotElems,
@@ -380,17 +386,49 @@ private:
         uint64_t headDim,
         uint32_t rowBegin,
         uint32_t rowEnd,
-        uint64_t roundBegin,
-        uint64_t roundEnd)
+        uint64_t blockBegin,
+        uint64_t blockEnd)
     {
-        // TODO: implement per the steps above (stream through accUb_/inUb_
-        // in TILE_FLOATS chunks).
+        // 1. Collect the round's (n2, s2BlockIdx) keys and their det slots.
+        //    The round's blockIds are [blockBegin, blockEnd).
+        KvEntry kvList[64];
+        uint32_t kvCount = 0;
+        for (uint64_t blockId = blockBegin; blockId < blockEnd; ++blockId) {
+            FAGBlockInfo info;
+            if (!fag_det::DecodeBlockById(decodeParams_, blockId, info)) {
+                continue;
+            }
+            kvList[kvCount++] = {info.n2Idx, info.s2BlockIdx, info.s2Extend};
+        }
+
+        // 2. Collect kv entries for each unique (n2, s2BlockIdx) pair.
+        uint64_t consumed = 0;
+        for (uint32_t i = 0; i < kvCount; ++i) {
+            if (consumed & (1ULL << i)) {
+                continue;
+            }
+            // 3. Copy valid rows of the head kv block into UB.
+            KvEntry head = kvList[i];
+            if (row > head.s2Extend) {
+                rowEnd = head.s2Extend;
+            }
+            // DataCopy
+            // accUb_
+            for (uint32_t j = i + 1; j < kvCount; ++j) {
+                if (kvList[j].n2Idx != head.n2Idx || kvList[j].s2BlockIdx != head.s2BlockIdx) {
+                    continue;
+                }
+                consumed |= (1ULL << j);
+                // 4. Accumulate
+            }
+        }
+
     }
 
     // dq path (dqPostAbsorb=1).  Contributors of one (n1, s1) block are
     // CONSECUTIVE blockIds (s2 innermost), so a single ascending scan can
     // process run by run:
-    //   1. merge the run's det slots in order (same as ProcessKv step 2);
+    //   1. merge the run's det slots in order (same as ProcessDkv step 2);
     //   2. existFirst = run contains s2BlockIdx == 0;
     //      existLast  = run contains s2BlockIdx ==
     //      fag_det::LastValidS2Block(s1);
@@ -405,8 +443,8 @@ private:
     CATLASS_DEVICE void ProcessDq(
         uint32_t rowBegin,
         uint32_t rowEnd,
-        uint64_t roundBegin,
-        uint64_t roundEnd)
+        uint64_t blockBegin,
+        uint64_t blockEnd)
     {
         // TODO: implement per the steps above (castUb_ holds the Cast
         // result before writing dqGm_).
