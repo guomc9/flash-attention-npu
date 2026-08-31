@@ -407,19 +407,33 @@ private:
             if (consumed & (1ULL << i)) {
                 continue;
             }
-            // 3. Copy valid rows of the head kv block into UB.
+            // 3. Copy valid rows of the head kv block from det-GM into acc-UB.
+            // rowEnd = min(rowEnd, head.s2Extend)
+            // rowNum: rowEnd - rowBegin
+            // slotId: i
+            // detOffset: slotId * dkDetSlotElems_ + rowBegin * qkDimAlign_
+            // src: dkDetWorkspaceGm_[detOffset]
+            // dst: accUb_
             KvEntry head = kvList[i];
             if (row > head.s2Extend) {
                 rowEnd = head.s2Extend;
             }
-            // DataCopy
-            // accUb_
+            uint32_t rowNum = rowEnd - rowBegin;
+            uint64_t detOffset = i * dkDetSlotElems + rowBegin * qkDimAlign_;
+            AscendC::DataCopyExtParams inParams{rowNum, qkDimAlign_ * sizeof(float), (qkDimAlign_ - qkHeadDim) * sizeof(float), 0, 0};
+            AscendC::DataCopyPadExtParams<float> inPadParams{false, 0, 0};
+            AscendC::DataCopyPad(accUb_, dkDetWorkspaceGm_[detOffset], inParams, inPadParams);
+
             for (uint32_t j = i + 1; j < kvCount; ++j) {
                 if (kvList[j].n2Idx != head.n2Idx || kvList[j].s2BlockIdx != head.s2BlockIdx) {
                     continue;
                 }
                 consumed |= (1ULL << j);
-                // 4. Accumulate
+                // 4. Copy valid rows of the next kv block from det-GM into in-UB, then Add(accUb_, accUb_, inUb_).
+                uint64_t nextDetOffset = j * dkDetSlotElems + rowBegin * qkDimAlign_;
+                AscendC::DataCopyPad(inUb_, dkDetWorkspaceGm_[nextDetOffset], inParams, inPadParams);
+                AscendC::Add(accUb_, accUb_, inUb_, rowNum * qkHeadDim);
+                
             }
         }
 
