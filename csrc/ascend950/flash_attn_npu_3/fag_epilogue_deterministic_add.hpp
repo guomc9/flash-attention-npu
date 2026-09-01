@@ -61,6 +61,7 @@ struct KvEntry {
     uint32_t n2Idx = 0;
     uint32_t s2BlockIdx = 0;
     uint32_t s2Extend = 0;
+    uint32_t slotId = 0;
     uint64_t totalS2Start = 0;
 };
 
@@ -376,6 +377,11 @@ private:
 
     static constexpr uint32_t TILE_FLOATS = 20U * 1024U;
 
+    // Max blocks issued in one round (waveSize_ = usedCoreNum *
+    // continuousBlockNum).  Also the width of the `consumed` bitmap in
+    // ProcessDkv — do NOT raise above 64 without widening the bitmap.
+    static constexpr uint32_t MAX_ROUND_TASKS = 64U;
+
     // dk/dv shared path.  For every (n2, s2BlockIdx) block touched by this
     // round:
     //   1. collect its accumList: blockIds in [blockBegin, blockEnd) whose
@@ -405,19 +411,24 @@ private:
         // 1. Collect the round's (n2, s2BlockIdx) keys and their det slots.
         //    The round's blockIds are [blockBegin, blockEnd).
         const uint32_t headNum = tiling_->kvHeadNum;
-        KvEntry kvList[64];
+        KvEntry kvList[MAX_ROUND_TASKS];
         uint32_t kvCount = 0;
         for (uint64_t blockId = blockBegin; blockId < blockEnd; ++blockId) {
             FAGBlockInfo info;
             if (!fag_det::DecodeBlockById(decodeParams_, blockId, info)) {
                 continue;
             }
-            kvList[kvCount++] = {info.n2Idx, info.s2BlockIdx, info.s2Extend, info.totalS2Start};
+            if (kvCount >= MAX_ROUND_TASKS) {
+                // No ASCENDC_ASSERT in this toolchain: trap so an oversized
+                // round hangs loudly here instead of corrupting the stack.
+                while (true) {
+                }
+            }
+            kvList[kvCount++] = {info.n2Idx, info.s2BlockIdx, info.s2Extend, blockId - blockBegin, info.totalS2Start};
         }
 
         // 2. Collect kv entries for each unique (n2, s2BlockIdx) pair.
         uint64_t consumed = 0;
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventMTE3ToV);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
         for (uint32_t i = 0; i < kvCount; ++i) {
@@ -428,34 +439,42 @@ private:
             //     rowEnd = min(rowEnd, first.s2Extend)
             //     rowNum: rowEnd - rowBegin
             //     slotId: i
-            //     detOffset: slotId * dkDetSlotElems_ + rowBegin * dimAlign
-            //     src: dkDetWorkspaceGm_[detOffset]
+            //     detOffset: slotId * slotElems + rowBegin * dimAlign
+            //     src: detGm[detOffset]
             //     dst: accUb_
             KvEntry first = kvList[i];
-            if (row > first.s2Extend) {
-                rowEnd = first.s2Extend;
-            }
             uint32_t rowNum = rowEnd - rowBegin;
-            uint64_t detOffset = i * dkDetSlotElems + rowBegin * dimAlign;
+            if (rowBegin >= first.s2Extend) {
+                for (uint32_t j = i + 1; j < kvCount; ++j) {
+                    if (kvList[j].n2Idx == first.n2Idx && kvList[j].totalS2Start == first.totalS2Start && kvList[j].s2BlockIdx == first.s2BlockIdx) {
+                        consumed |= (1ULL << j);
+                    }
+                }
+                continue;
+            }
+            else if (rowEnd > first.s2Extend) {
+                rowNum = first.s2Extend - rowBegin;
+            }
+            uint64_t detOffset = i * slotElems + rowBegin * dimAlign;
             AscendC::DataCopyExtParams inParams{rowNum, headDim * sizeof(float), (dimAlign - headDim) * sizeof(float), 0, 0};
-            AscendC::DataCopyPadExtParams<float> inPadParams{false, 0, 0};
+            AscendC::DataCopyPadExtParams<float> inPadParams{false, 0, 0, 0};
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
             AscendC::DataCopyPad(accUb_, detGm[detOffset], inParams, inPadParams);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
             for (uint32_t j = i + 1; j < kvCount; ++j) {
-                if (kvList[j].n2Idx != first.n2Idx || kvList[j].s2BlockIdx != first.s2BlockIdx) {
+                if (kvList[j].n2Idx != first.n2Idx || kvList[j].totalS2Start != first.totalS2Start || kvList[j].s2BlockIdx != first.s2BlockIdx) {
                     continue;
                 }
                 consumed |= (1ULL << j);
                 // 4. Copy valid rows of the next kv block from det-GM into in-UB, then Add(accUb_, accUb_, inUb_).
-                uint64_t nextDetOffset = j * dkDetSlotElems + rowBegin * dimAlign;
+                uint64_t nextDetOffset = j * slotElems + rowBegin * dimAlign;
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
                 AscendC::DataCopyPad(inUb_, detGm[nextDetOffset], inParams, inPadParams);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
                 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
-                AscendC::Add(accUb_, accUb_, inUb_, rowNum * dimAlign);
+                AscendC::Add(accUb_, accUb_, inUb_, rowNum * headDim);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
             }
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
@@ -464,15 +483,14 @@ private:
             //     src: accUb_
             //     dst: wsGm[wsOffset]
             uint64_t wsOffset = (first.totalS2Start * headNum + first.n2Idx) * headDim + rowBegin * headNum * headDim;
-            AscendC::DataCopyExtParams outParams{rowNum, headNum * sizeof(float), 0, (headNum - 1) * dimAlign * sizeof(float), 0};
-            AscendC::DataCopyPadExtParams<float> outPadParams{false, 0, 0};
+            AscendC::DataCopyExtParams outParams{rowNum, headDim * sizeof(float), 0, (headNum - 1) * headDim * sizeof(float), 0};
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
             AscendC::SetAtomicType<float>();
-            AscendC::DataCopyPad(wsGm[wsOffset], accUb_, outParams, outPadParams);
+            AscendC::DataCopyPad(wsGm[wsOffset], accUb_, outParams);
             AscendC::SetAtomicNone();
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
         }
-
+        return ;
     }
 
     // dq path (dqPostAbsorb=1).  Contributors of one (n1, s1) block are
