@@ -448,7 +448,7 @@ private:
                 if (rowEnd > first.s2Extend) {
                     rowNum = first.s2Extend - rowBegin;
                 }
-                // 3. Copy valid rows of the first kv block from det-GM into acc-UB.
+                // 3. Copy valid rows of the first Dkv block from det-GM into acc-UB.
                 //     rowNum: min(rowEnd, first.s2Extend) - rowBegin
                 //     detOffset: slotId * slotElems + rowBegin * dimAlign
                 //     src: detGm[detOffset]
@@ -465,7 +465,7 @@ private:
                         continue;
                     }
                     consumed |= (1ULL << j);
-                    // 4. Copy valid rows of the next kv block from det-GM into in-UB, then Add(accUb_, accUb_, inUb_).
+                    // 4. Copy valid rows of the next Dkv block from det-GM into in-UB, then Add(accUb_, accUb_, inUb_).
                     uint64_t nextDetOffset = kvList[j].slotId * slotElems + rowBegin * dimAlign;
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
                     AscendC::DataCopyPad(inUb_, detGm[nextDetOffset], inParams, inPadParams);
@@ -510,29 +510,96 @@ private:
         uint64_t blockBegin,
         uint64_t blockEnd)
     {
-        // TODO: implement per the steps above (castUb_ holds the Cast
-        // result before writing dqGm_).
+        const uint32_t headNum = tiling_->qHeadNum;
         uint32_t headBlockId = blockBegin;
+        uint32_t rowNum = rowEnd - rowBegin;
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
         while (headBlockId < blockEnd) {
-            FAGBlockInfo firstBlockInfo;
-            if (!fag_det::DecodeBlockById(decodeParams_, headBlockId, firstBlockInfo)) {
+            FAGBlockInfo headBlockInfo;
+            if (!fag_det::DecodeBlockById(decodeParams_, headBlockId, headBlockInfo)) {
                 ++headBlockId;
                 continue;
             }
-            uint32_t lastValidS2Block = fag_det::LastValidS2Block(firstBlockInfo.s1BlockIdx);
-            bool existFirst = (firstBlockInfo.s2BlockIdx == 0);
-            bool existLast = (firstBlockInfo.s2BlockIdx == lastValidS2Block);
+            uint32_t lastValidS2Block = fag_det::LastValidS2Block(
+                headBlockInfo.curBatchS1, headBlockInfo.curBatchS2, 
+                headBlockInfo.s1BlockIdx, decodeParams_.qBlockSize, decodeParams_.kvBlockSize, decodeParams_.isAttenMask);
+            bool existFirst = (headBlockInfo.s2BlockIdx == 0);
+            bool existLast = (headBlockInfo.s2BlockIdx == lastValidS2Block);
             uint32_t nextBlockId = headBlockId + 1;
+
+            // 1. Copy valid rows of the head Dq block from det-GM into acc-UB.
+            uint32_t slotId = static_cast<uint32_t>(headBlockId - blockBegin);
+            uint64_t detOffset = slotId * dqDetSlotElems_ + rowBegin * qkDimAlign_;
+            AscendC::DataCopyExtParams inParams{rowNum, qkHeadDim * sizeof(float), (qkDimAlign_ - qkHeadDim) * sizeof(float), 0, 0};
+            AscendC::DataCopyPadExtParams<float> inPadParams{false, 0, 0, 0};
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
+            AscendC::DataCopyPad(accUb_, dqDetWorkspaceGm_[detOffset], inParams, inPadParams);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
+
             while (nextBlockId < blockEnd)
             {
+                FAGBlockInfo nextBlockInfo;
                 if (!fag_det::DecodeBlockById(decodeParams_, nextBlockId, nextBlockInfo)) {
                     ++nextBlockId;
                     continue;
                 }
-                
+                if (nextBlockInfo.groupIdx != headBlockInfo.groupIdx || nextBlockInfo.totalS1Start != headBlockInfo.totalS1Start 
+                     || nextBlockInfo.n2Idx != headBlockInfo.n2Idx) {
+                    break;
+                }
+                // 2. Copy valid rows of the next Dq block from det-GM into acc-UB, then Add(accUb_, accUb_, inUb_).
+                uint32_t nextSlotId = static_cast<uint32_t>(nextBlockId - blockBegin);
+                uint64_t nextDetOffset = nextSlotId * dqDetSlotElems_ + rowBegin * qkDimAlign_;
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
+                AscendC::DataCopyPad(inUb_, dqDetWorkspaceGm_[nextDetOffset], inParams, inPadParams);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
+                AscendC::Add(accUb_, accUb_, inUb_, rowNum * qkHeadDim);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
+                existLast |= (nextBlockInfo.s2BlockIdx == lastValidS2Block);
                 ++nextBlockId;
             }
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
+            // 3. Write acc-UB into dqGm_ or dqWorkspace_ according to the four branches.
+            uint64_t dqOffset = headBlockInfo.qOffset + rowBegin * headNum * qkHeadDim;
+            if (existLast && !existFirst) {
+                // Atomic add acc-UB into dqWorkspace_, then read-back, Muls(scaleValue_), Cast, write dqGm_.
+                uint64_t wsOffset = rowBegin * qkDimAlign_;
+                AscendC::DataCopyExtParams outParams{rowNum, qkHeadDim * sizeof(float), 0, (qkDimAlign_ - qkHeadDim) * sizeof(float), 0};
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
+                AscendC::SetAtomicType<float>();
+                AscendC::DataCopyPad(dqWorkspace_[wsOffset], accUb_, outParams);
+                AscendC::SetAtomicNone();
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
+                // Todo: read-back dqWorkspace_, Muls(scaleValue_), Cast, write dqGm_ at dqOffset
+                // ...
+            }
+            else if (existLast && existFirst) {
+                // Directly acc-UB Muls(scaleValue_), Cast, write dqGm_.
+                // ...
+            }
+            else if (!existLast && existFirst) {
+                // Write acc-UB into dqWorkspace_.
+                uint64_t wsOffset = rowBegin * qkDimAlign_;
+                AscendC::DataCopyExtParams outParams{rowNum, qkHeadDim * sizeof(float), 0, (qkDimAlign_ - qkHeadDim) * sizeof(float), 0};
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
+                AscendC::DataCopyPad(dqWorkspace_[wsOffset], accUb_, outParams);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
+            }
+            else {
+                // Atomic add acc-UB into dqWorkspace_.
+                uint64_t wsOffset = rowBegin * qkDimAlign_;
+                AscendC::DataCopyExtParams outParams{rowNum, qkHeadDim * sizeof(float), 0, (qkDimAlign_ - qkHeadDim) * sizeof(float), 0};
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
+                AscendC::SetAtomicType<float>();
+                AscendC::DataCopyPad(dqWorkspace_[wsOffset], accUb_, outParams);
+                AscendC::SetAtomicNone();
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
+            }
+            headBlockId = nextBlockId;
         }
+        return;
     }
 
     const __gm__ TilingData *tiling_ = nullptr;
@@ -549,6 +616,12 @@ private:
     GM_ADDR readyCounter_ = nullptr;   // v2
     GM_ADDR doneCounter_ = nullptr;    // v2
 
+    // UB buffers borrowed from the main pipeline (round-end SyncAll makes the
+    // window safe).  accUb_/inUb_ are shared by ProcessDq and ProcessDkv: a
+    // core belongs to exactly one group per round, so the two paths are
+    // mutually exclusive and never live at once; reuse ordering within each
+    // path is guarded by the event_* flags below.  castUb_ is dq-only (Cast
+    // result before writing dqGm_).
     AscendC::LocalTensor<float> accUb_;
     AscendC::LocalTensor<float> inUb_;
     AscendC::LocalTensor<DataType> castUb_;
@@ -565,6 +638,7 @@ private:
     event_t eventAccUBMTE3ToMTE2 = 0;
     event_t eventAccUBMTE2ToV = 0;
     event_t eventAccUBVToMTE3 = 0;
+    // event_t eventAccUBVToV = 0;
     event_t eventInUBVToMTE2 = 0;
     event_t eventInUBMTE2ToV = 0;
 };
