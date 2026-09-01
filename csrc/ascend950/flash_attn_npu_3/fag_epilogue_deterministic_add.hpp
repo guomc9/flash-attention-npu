@@ -295,19 +295,17 @@ public:
         castUb_ = resource.ubBuf.template GetBufferByByte<DataType>(
             2U * TILE_FLOATS * sizeof(float));
 
+        eventAccUBMTE3ToMTE2 = static_cast<event_t>(
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
         eventAccUBMTE2ToV = static_cast<event_t>(
             GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
-        eventAccUBVToMTE2 = static_cast<event_t>(
-            GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
+        eventAccUBVToMTE3 = static_cast<event_t>(
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
         eventInUBMTE2ToV = static_cast<event_t>(
             GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
         eventInUBVToMTE2 = static_cast<event_t>(
             GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
 
-        eventVToMTE3 = static_cast<event_t>(
-            GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
-        eventMTE3ToV = static_cast<event_t>(
-            GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>());
     }
 
     CATLASS_DEVICE void operator()(
@@ -420,7 +418,7 @@ private:
         // 2. Collect kv entries for each unique (n2, s2BlockIdx) pair.
         uint64_t consumed = 0;
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventMTE3ToV);
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventAccUBVToMTE2);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
         for (uint32_t i = 0; i < kvCount; ++i) {
             if (consumed & (1ULL << i)) {
@@ -441,7 +439,7 @@ private:
             uint64_t detOffset = i * dkDetSlotElems + rowBegin * dimAlign;
             AscendC::DataCopyExtParams inParams{rowNum, headDim * sizeof(float), (dimAlign - headDim) * sizeof(float), 0, 0};
             AscendC::DataCopyPadExtParams<float> inPadParams{false, 0, 0};
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventAccUBVToMTE2);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
             AscendC::DataCopyPad(accUb_, detGm[detOffset], inParams, inPadParams);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
@@ -460,7 +458,7 @@ private:
                 AscendC::Add(accUb_, accUb_, inUb_, rowNum * dimAlign);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
             }
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventVToMTE3);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
             // 5. Atomic add acc-UB into ws-GM.
             //     wsOffset: (first.totalS2Start * headNum + first.n2Idx) * headDim + rowBegin * headNum * headDim
             //     src: accUb_
@@ -468,11 +466,11 @@ private:
             uint64_t wsOffset = (first.totalS2Start * headNum + first.n2Idx) * headDim + rowBegin * headNum * headDim;
             AscendC::DataCopyExtParams outParams{rowNum, headNum * sizeof(float), 0, (headNum - 1) * dimAlign * sizeof(float), 0};
             AscendC::DataCopyPadExtParams<float> outPadParams{false, 0, 0};
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventVToMTE3);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
             AscendC::SetAtomicType<float>();
             AscendC::DataCopyPad(wsGm[wsOffset], accUb_, outParams, outPadParams);
             AscendC::SetAtomicNone();
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventAccUBVToMTE2);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
         }
 
     }
@@ -529,12 +527,11 @@ private:
     uint64_t waveSize_ = 0;
     float scaleValue_ = 1.0f;
 
-    event_t eventAccUBVToMTE2 = 0;
+    event_t eventAccUBMTE3ToMTE2 = 0;
     event_t eventAccUBMTE2ToV = 0;
+    event_t eventAccUBVToMTE3 = 0;
     event_t eventInUBVToMTE2 = 0;
     event_t eventInUBMTE2ToV = 0;
-    event_t eventMTE3ToV = 0;
-    event_t eventVToMTE3 = 0;
 };
 
 }  // namespace Catlass::Epilogue::Block
