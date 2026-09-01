@@ -377,10 +377,10 @@ private:
 
     static constexpr uint32_t TILE_FLOATS = 20U * 1024U;
 
-    // Max blocks issued in one round (waveSize_ = usedCoreNum *
-    // continuousBlockNum).  Also the width of the `consumed` bitmap in
-    // ProcessDkv — do NOT raise above 64 without widening the bitmap.
-    static constexpr uint32_t MAX_ROUND_TASKS = 64U;
+    // Chunk size for the round scan: the on-stack task table and the 64-bit
+    // consumed bitmap below cover one chunk; rounds larger than this are
+    // processed in multiple chunks.
+    static constexpr uint32_t MAX_DTM_CHUNK_TASKS = FAGTiling950::MAX_DTM_CHUNK_TASKS;
 
     // dk/dv shared path.  For every (n2, s2BlockIdx) block touched by this
     // round:
@@ -389,14 +389,14 @@ private:
     //      order gives the fixed merge order for free);
     //   2. acc = slot(accumList[0]) rows [rowBegin,rowEnd); for each further
     //      member: DataCopyPad into inUb_, Add(accUb_, accUb_, inUb_);
-    //      slot addr = detBase + (blockId % waveSize_) * slotElems
-    //      + rowBegin * dimAlign;
+    //      slot addr = detBase + slotId * slotElems + rowBegin * dimAlign
+    //      with slotId = blockId % waveSize_ (round-relative);
     //   3. SetAtomicType<float>() + DataCopyPad into ws at
-    //      (totalS2Start * kvHeadNum + n2) * dimAlign + rowBegin * dimAlign,
-    //      then SetAtomicNone().
+    //      (totalS2Start * kvHeadNum + n2) * headDim
+    //      + rowBegin * kvHeadNum * headDim, then SetAtomicNone().
     // Note: contributors of one (n2,s2) key are NOT consecutive under
-    // bn2s1gs2 (s1 outer, g inner); buffer the round's (key, slotId) pairs
-    // (at most waveSize entries) and group them in a second pass.
+    // bn2s1gs2 (s1 outer, g inner); buffer the chunk's (key, slotId) pairs
+    // (at most MAX_DTM_CHUNK_TASKS entries) and group them in a second pass.
     CATLASS_DEVICE void ProcessDkv(
         AscendC::GlobalTensor<float> &detGm,
         AscendC::GlobalTensor<float> &wsGm,
@@ -408,89 +408,86 @@ private:
         uint64_t blockBegin,
         uint64_t blockEnd)
     {
-        // 1. Collect the round's (n2, s2BlockIdx) keys and their det slots.
-        //    The round's blockIds are [blockBegin, blockEnd).
         const uint32_t headNum = tiling_->kvHeadNum;
-        KvEntry kvList[MAX_ROUND_TASKS];
-        uint32_t kvCount = 0;
-        for (uint64_t blockId = blockBegin; blockId < blockEnd; ++blockId) {
-            FAGBlockInfo info;
-            if (!fag_det::DecodeBlockById(decodeParams_, blockId, info)) {
-                continue;
-            }
-            if (kvCount >= MAX_ROUND_TASKS) {
-                // No ASCENDC_ASSERT in this toolchain: trap so an oversized
-                // round hangs loudly here instead of corrupting the stack.
-                while (true) {
-                }
-            }
-            kvList[kvCount++] = {info.n2Idx, info.s2BlockIdx, info.s2Extend, blockId - blockBegin, info.totalS2Start};
-        }
-
-        // 2. Collect kv entries for each unique (n2, s2BlockIdx) pair.
-        uint64_t consumed = 0;
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
-        for (uint32_t i = 0; i < kvCount; ++i) {
-            if (consumed & (1ULL << i)) {
-                continue;
-            }
-            // 3. Copy valid rows of the first kv block from det-GM into acc-UB.
-            //     rowEnd = min(rowEnd, first.s2Extend)
-            //     rowNum: rowEnd - rowBegin
-            //     slotId: i
-            //     detOffset: slotId * slotElems + rowBegin * dimAlign
-            //     src: detGm[detOffset]
-            //     dst: accUb_
-            KvEntry first = kvList[i];
-            uint32_t rowNum = rowEnd - rowBegin;
-            if (rowBegin >= first.s2Extend) {
-                for (uint32_t j = i + 1; j < kvCount; ++j) {
-                    if (kvList[j].n2Idx == first.n2Idx && kvList[j].totalS2Start == first.totalS2Start && kvList[j].s2BlockIdx == first.s2BlockIdx) {
-                        consumed |= (1ULL << j);
-                    }
-                }
-                continue;
-            }
-            else if (rowEnd > first.s2Extend) {
-                rowNum = first.s2Extend - rowBegin;
-            }
-            uint64_t detOffset = i * slotElems + rowBegin * dimAlign;
-            AscendC::DataCopyExtParams inParams{rowNum, headDim * sizeof(float), (dimAlign - headDim) * sizeof(float), 0, 0};
-            AscendC::DataCopyPadExtParams<float> inPadParams{false, 0, 0, 0};
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
-            AscendC::DataCopyPad(accUb_, detGm[detOffset], inParams, inPadParams);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
-            for (uint32_t j = i + 1; j < kvCount; ++j) {
-                if (kvList[j].n2Idx != first.n2Idx || kvList[j].totalS2Start != first.totalS2Start || kvList[j].s2BlockIdx != first.s2BlockIdx) {
+        // Chunk the round so the on-stack table and the 64-bit consumed bitmap always fit, however large the round gets.
+        // A key split at a chunk boundary is reduced once per chunk; the fixed chunk order and disjoint per-core rows
+        // keep the result deterministic.
+        for (uint64_t chunkBegin = blockBegin; chunkBegin < blockEnd; chunkBegin += MAX_DTM_CHUNK_TASKS) {
+            const uint64_t chunkEnd = (chunkBegin + MAX_DTM_CHUNK_TASKS < blockEnd) ? chunkBegin + MAX_DTM_CHUNK_TASKS : blockEnd;
+
+            // 1. Collect this chunk's (n2, s2BlockIdx) keys and det slots.
+            //    slotId stays round-relative (= blockId % waveSize_), NOT chunk-relative.
+            KvEntry kvList[MAX_DTM_CHUNK_TASKS];
+            uint32_t kvCount = 0;
+            for (uint64_t blockId = chunkBegin; blockId < chunkEnd; ++blockId) {
+                FAGBlockInfo info;
+                if (!fag_det::DecodeBlockById(decodeParams_, blockId, info)) {
                     continue;
                 }
-                consumed |= (1ULL << j);
-                // 4. Copy valid rows of the next kv block from det-GM into in-UB, then Add(accUb_, accUb_, inUb_).
-                uint64_t nextDetOffset = j * slotElems + rowBegin * dimAlign;
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
-                AscendC::DataCopyPad(inUb_, detGm[nextDetOffset], inParams, inPadParams);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
-                
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
-                AscendC::Add(accUb_, accUb_, inUb_, rowNum * headDim);
-                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
+                kvList[kvCount++] = {info.n2Idx, info.s2BlockIdx, info.s2Extend, static_cast<uint32_t>(blockId - blockBegin), info.totalS2Start};
             }
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
-            // 5. Atomic add acc-UB into ws-GM.
-            //     wsOffset: (first.totalS2Start * headNum + first.n2Idx) * headDim + rowBegin * headNum * headDim
-            //     src: accUb_
-            //     dst: wsGm[wsOffset]
-            uint64_t wsOffset = (first.totalS2Start * headNum + first.n2Idx) * headDim + rowBegin * headNum * headDim;
-            AscendC::DataCopyExtParams outParams{rowNum, headDim * sizeof(float), 0, (headNum - 1) * headDim * sizeof(float), 0};
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
-            AscendC::SetAtomicType<float>();
-            AscendC::DataCopyPad(wsGm[wsOffset], accUb_, outParams);
-            AscendC::SetAtomicNone();
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
+
+            // 2. Collect kv entries for each unique (n2, s2BlockIdx) pair.
+            uint64_t consumed = 0;
+            for (uint32_t i = 0; i < kvCount; ++i) {
+                if (consumed & (1ULL << i)) {
+                    continue;
+                }
+                KvEntry first = kvList[i];
+                uint32_t rowNum = rowEnd - rowBegin;
+                if (rowBegin >= first.s2Extend) {
+                    for (uint32_t j = i + 1; j < kvCount; ++j) {
+                        if (kvList[j].n2Idx == first.n2Idx && kvList[j].totalS2Start == first.totalS2Start && kvList[j].s2BlockIdx == first.s2BlockIdx) {
+                            consumed |= (1ULL << j);
+                        }
+                    }
+                    continue;
+                }
+                if (rowEnd > first.s2Extend) {
+                    rowNum = first.s2Extend - rowBegin;
+                }
+                // 3. Copy valid rows of the first kv block from det-GM into acc-UB.
+                //     rowNum: min(rowEnd, first.s2Extend) - rowBegin
+                //     detOffset: slotId * slotElems + rowBegin * dimAlign
+                //     src: detGm[detOffset]
+                //     dst: accUb_
+                uint64_t detOffset = kvList[i].slotId * slotElems + rowBegin * dimAlign;
+                AscendC::DataCopyExtParams inParams{rowNum, headDim * sizeof(float), (dimAlign - headDim) * sizeof(float), 0, 0};
+                AscendC::DataCopyPadExtParams<float> inPadParams{false, 0, 0, 0};
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
+                AscendC::DataCopyPad(accUb_, detGm[detOffset], inParams, inPadParams);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
+                for (uint32_t j = i + 1; j < kvCount; ++j) {
+                    if (kvList[j].n2Idx != first.n2Idx || kvList[j].totalS2Start != first.totalS2Start || kvList[j].s2BlockIdx != first.s2BlockIdx) {
+                        continue;
+                    }
+                    consumed |= (1ULL << j);
+                    // 4. Copy valid rows of the next kv block from det-GM into in-UB, then Add(accUb_, accUb_, inUb_).
+                    uint64_t nextDetOffset = kvList[j].slotId * slotElems + rowBegin * dimAlign;
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
+                    AscendC::DataCopyPad(inUb_, detGm[nextDetOffset], inParams, inPadParams);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
+                    AscendC::Add(accUb_, accUb_, inUb_, rowNum * headDim);
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
+                }
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
+                // 5. Atomic add acc-UB into ws-GM.
+                //     wsOffset: (first.totalS2Start * headNum + first.n2Idx) * headDim + rowBegin * headNum * headDim
+                //     src: accUb_
+                //     dst: wsGm[wsOffset]
+                uint64_t wsOffset = (first.totalS2Start * headNum + first.n2Idx) * headDim + rowBegin * headNum * headDim;
+                AscendC::DataCopyExtParams outParams{rowNum, headDim * sizeof(float), 0, (headNum - 1) * headDim * sizeof(float), 0};
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
+                AscendC::SetAtomicType<float>();
+                AscendC::DataCopyPad(wsGm[wsOffset], accUb_, outParams);
+                AscendC::SetAtomicNone();
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
+            }
         }
-        return ;
     }
 
     // dq path (dqPostAbsorb=1).  Contributors of one (n1, s1) block are
@@ -498,8 +495,7 @@ private:
     // process run by run:
     //   1. merge the run's det slots in order (same as ProcessDkv step 2);
     //   2. existFirst = run contains s2BlockIdx == 0;
-    //      existLast  = run contains s2BlockIdx ==
-    //      fag_det::LastValidS2Block(s1);
+    //      existLast  = run contains s2BlockIdx == fag_det::LastValidS2Block(s1);
     //   3. four branches:
     //      last && !first: Add(acc, read-back dqWorkspace_) [old value LAST]
     //                      -> Muls(scaleValue_) -> Cast -> write dqGm_ at
@@ -516,6 +512,27 @@ private:
     {
         // TODO: implement per the steps above (castUb_ holds the Cast
         // result before writing dqGm_).
+        uint32_t headBlockId = blockBegin;
+        while (headBlockId < blockEnd) {
+            FAGBlockInfo firstBlockInfo;
+            if (!fag_det::DecodeBlockById(decodeParams_, headBlockId, firstBlockInfo)) {
+                ++headBlockId;
+                continue;
+            }
+            uint32_t lastValidS2Block = fag_det::LastValidS2Block(firstBlockInfo.s1BlockIdx);
+            bool existFirst = (firstBlockInfo.s2BlockIdx == 0);
+            bool existLast = (firstBlockInfo.s2BlockIdx == lastValidS2Block);
+            uint32_t nextBlockId = headBlockId + 1;
+            while (nextBlockId < blockEnd)
+            {
+                if (!fag_det::DecodeBlockById(decodeParams_, nextBlockId, nextBlockInfo)) {
+                    ++nextBlockId;
+                    continue;
+                }
+                
+                ++nextBlockId;
+            }
+        }
     }
 
     const __gm__ TilingData *tiling_ = nullptr;

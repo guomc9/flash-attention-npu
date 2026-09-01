@@ -24,6 +24,13 @@ constexpr uint64_t MULTI_CORE_SYNC_BYTES = 64 * 1024;
 constexpr uint32_t SOFTMAX_REDUCE_FLOATS = 8;
 constexpr uint32_t DEFAULT_CONTINUOUS_BLOCK_NUM = 2;
 
+// VecDTM chunk size: the device epilogue (fag_epilogue_deterministic_add.hpp)
+// rebuilds one chunk of a round's task list in a fixed-size on-stack table of
+// this many entries, tracked by a 64-bit consumed bitmap — do NOT raise
+// above 64 without widening both.  Rounds larger than this are legal and are
+// processed in multiple chunks.
+constexpr uint32_t MAX_DTM_CHUNK_TASKS = 64;
+
 enum class Layout : uint32_t {
     BSND = 0,
     TND = 1,
