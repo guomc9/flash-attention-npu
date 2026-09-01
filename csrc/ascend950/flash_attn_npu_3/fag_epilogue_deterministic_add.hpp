@@ -61,6 +61,7 @@ struct KvEntry {
     uint32_t n2Idx = 0;
     uint32_t s2BlockIdx = 0;
     uint32_t s2Extend = 0;
+    uint64_t totalS2Start = 0;
 };
 
 CATLASS_DEVICE inline BatchShape GetBatchShape(
@@ -293,6 +294,20 @@ public:
             TILE_FLOATS * sizeof(float));
         castUb_ = resource.ubBuf.template GetBufferByByte<DataType>(
             2U * TILE_FLOATS * sizeof(float));
+
+        eventAccUBMTE2ToV = static_cast<event_t>(
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
+        eventAccUBVToMTE2 = static_cast<event_t>(
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
+        eventInUBMTE2ToV = static_cast<event_t>(
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
+        eventInUBVToMTE2 = static_cast<event_t>(
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
+
+        eventVToMTE3 = static_cast<event_t>(
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+        eventMTE3ToV = static_cast<event_t>(
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>());
     }
 
     CATLASS_DEVICE void operator()(
@@ -391,6 +406,7 @@ private:
     {
         // 1. Collect the round's (n2, s2BlockIdx) keys and their det slots.
         //    The round's blockIds are [blockBegin, blockEnd).
+        const uint32_t headNum = tiling_->kvHeadNum;
         KvEntry kvList[64];
         uint32_t kvCount = 0;
         for (uint64_t blockId = blockBegin; blockId < blockEnd; ++blockId) {
@@ -398,43 +414,65 @@ private:
             if (!fag_det::DecodeBlockById(decodeParams_, blockId, info)) {
                 continue;
             }
-            kvList[kvCount++] = {info.n2Idx, info.s2BlockIdx, info.s2Extend};
+            kvList[kvCount++] = {info.n2Idx, info.s2BlockIdx, info.s2Extend, info.totalS2Start};
         }
 
         // 2. Collect kv entries for each unique (n2, s2BlockIdx) pair.
         uint64_t consumed = 0;
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventMTE3ToV);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventAccUBVToMTE2);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
         for (uint32_t i = 0; i < kvCount; ++i) {
             if (consumed & (1ULL << i)) {
                 continue;
             }
-            // 3. Copy valid rows of the head kv block from det-GM into acc-UB.
-            // rowEnd = min(rowEnd, head.s2Extend)
-            // rowNum: rowEnd - rowBegin
-            // slotId: i
-            // detOffset: slotId * dkDetSlotElems_ + rowBegin * qkDimAlign_
-            // src: dkDetWorkspaceGm_[detOffset]
-            // dst: accUb_
-            KvEntry head = kvList[i];
-            if (row > head.s2Extend) {
-                rowEnd = head.s2Extend;
+            // 3. Copy valid rows of the first kv block from det-GM into acc-UB.
+            //     rowEnd = min(rowEnd, first.s2Extend)
+            //     rowNum: rowEnd - rowBegin
+            //     slotId: i
+            //     detOffset: slotId * dkDetSlotElems_ + rowBegin * dimAlign
+            //     src: dkDetWorkspaceGm_[detOffset]
+            //     dst: accUb_
+            KvEntry first = kvList[i];
+            if (row > first.s2Extend) {
+                rowEnd = first.s2Extend;
             }
             uint32_t rowNum = rowEnd - rowBegin;
-            uint64_t detOffset = i * dkDetSlotElems + rowBegin * qkDimAlign_;
-            AscendC::DataCopyExtParams inParams{rowNum, qkDimAlign_ * sizeof(float), (qkDimAlign_ - qkHeadDim) * sizeof(float), 0, 0};
+            uint64_t detOffset = i * dkDetSlotElems + rowBegin * dimAlign;
+            AscendC::DataCopyExtParams inParams{rowNum, headDim * sizeof(float), (dimAlign - headDim) * sizeof(float), 0, 0};
             AscendC::DataCopyPadExtParams<float> inPadParams{false, 0, 0};
-            AscendC::DataCopyPad(accUb_, dkDetWorkspaceGm_[detOffset], inParams, inPadParams);
-
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventAccUBVToMTE2);
+            AscendC::DataCopyPad(accUb_, detGm[detOffset], inParams, inPadParams);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
             for (uint32_t j = i + 1; j < kvCount; ++j) {
-                if (kvList[j].n2Idx != head.n2Idx || kvList[j].s2BlockIdx != head.s2BlockIdx) {
+                if (kvList[j].n2Idx != first.n2Idx || kvList[j].s2BlockIdx != first.s2BlockIdx) {
                     continue;
                 }
                 consumed |= (1ULL << j);
                 // 4. Copy valid rows of the next kv block from det-GM into in-UB, then Add(accUb_, accUb_, inUb_).
-                uint64_t nextDetOffset = j * dkDetSlotElems + rowBegin * qkDimAlign_;
-                AscendC::DataCopyPad(inUb_, dkDetWorkspaceGm_[nextDetOffset], inParams, inPadParams);
-                AscendC::Add(accUb_, accUb_, inUb_, rowNum * qkHeadDim);
+                uint64_t nextDetOffset = j * dkDetSlotElems + rowBegin * dimAlign;
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
+                AscendC::DataCopyPad(inUb_, detGm[nextDetOffset], inParams, inPadParams);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
                 
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
+                AscendC::Add(accUb_, accUb_, inUb_, rowNum * dimAlign);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
             }
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventVToMTE3);
+            // 5. Atomic add acc-UB into ws-GM.
+            //     wsOffset: (first.totalS2Start * headNum + first.n2Idx) * headDim + rowBegin * headNum * headDim
+            //     src: accUb_
+            //     dst: wsGm[wsOffset]
+            uint64_t wsOffset = (first.totalS2Start * headNum + first.n2Idx) * headDim + rowBegin * headNum * headDim;
+            AscendC::DataCopyExtParams outParams{rowNum, headNum * sizeof(float), 0, (headNum - 1) * dimAlign * sizeof(float), 0};
+            AscendC::DataCopyPadExtParams<float> outPadParams{false, 0, 0};
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventVToMTE3);
+            AscendC::SetAtomicType<float>();
+            AscendC::DataCopyPad(wsGm[wsOffset], accUb_, outParams, outPadParams);
+            AscendC::SetAtomicNone();
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventAccUBVToMTE2);
         }
 
     }
@@ -490,6 +528,13 @@ private:
     uint64_t dvDetSlotElems_ = 0;
     uint64_t waveSize_ = 0;
     float scaleValue_ = 1.0f;
+
+    event_t eventAccUBVToMTE2 = 0;
+    event_t eventAccUBMTE2ToV = 0;
+    event_t eventInUBVToMTE2 = 0;
+    event_t eventInUBMTE2ToV = 0;
+    event_t eventMTE3ToV = 0;
+    event_t eventVToMTE3 = 0;
 };
 
 }  // namespace Catlass::Epilogue::Block
