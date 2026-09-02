@@ -306,7 +306,10 @@ public:
             GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>());
         eventInUBVToMTE2 = static_cast<event_t>(
             GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
-
+        eventCastUBMTE3ToV = static_cast<event_t>(
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>());
+        eventCastUBVToMTE3 = static_cast<event_t>(
+            GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
     }
 
     CATLASS_DEVICE void operator()(
@@ -513,8 +516,9 @@ private:
         const uint32_t headNum = tiling_->qHeadNum;
         uint32_t headBlockId = blockBegin;
         uint32_t rowNum = rowEnd - rowBegin;
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
         while (headBlockId < blockEnd) {
             FAGBlockInfo headBlockInfo;
             if (!fag_det::DecodeBlockById(decodeParams_, headBlockId, headBlockInfo)) {
@@ -536,7 +540,7 @@ private:
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
             AscendC::DataCopyPad(accUb_, dqDetWorkspaceGm_[detOffset], inParams, inPadParams);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
-
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
             while (nextBlockId < blockEnd)
             {
                 FAGBlockInfo nextBlockInfo;
@@ -560,40 +564,65 @@ private:
                 existLast |= (nextBlockInfo.s2BlockIdx == lastValidS2Block);
                 ++nextBlockId;
             }
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
-            // 3. Write acc-UB into dqGm_ or dqWorkspace_ according to the four branches.
+            // 3. Write acc-UB into dqGm_ or dqWorkspace_ according to the 4 branches.
             uint64_t dqOffset = headBlockInfo.qOffset + rowBegin * headNum * qkHeadDim;
             if (existLast && !existFirst) {
-                // Atomic add acc-UB into dqWorkspace_, then read-back, Muls(scaleValue_), Cast, write dqGm_.
+                // Read-back dqWorkspace_ into inUb_, then Add(accUb_, inUb_), Muls(scaleValue_), Cast, write dqGm_.
                 uint64_t wsOffset = rowBegin * qkDimAlign_;
-                AscendC::DataCopyExtParams outParams{rowNum, qkHeadDim * sizeof(float), 0, (qkDimAlign_ - qkHeadDim) * sizeof(float), 0};
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
-                AscendC::SetAtomicType<float>();
-                AscendC::DataCopyPad(dqWorkspace_[wsOffset], accUb_, outParams);
-                AscendC::SetAtomicNone();
+                AscendC::DataCopyExtParams inWsParams{rowNum, qkHeadDim * sizeof(float), (qkDimAlign_ - qkHeadDim) * sizeof(float), 0, 0};
+                AscendC::DataCopyPadExtParams<float> inWsPadParams{false, 0, 0, 0};
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
+                AscendC::DataCopyPad(inUb_, dqWorkspace_[wsOffset], inWsParams, inWsPadParams);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventInUBMTE2ToV);
+                AscendC::Add(accUb_, accUb_, inUb_, rowNum * qkHeadDim);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
+                
+                PipeBarrier<PIPE_V>();
+                AscendC::Muls(accUb_, accUb_, scaleValue_, rowNum * qkHeadDim);
+                PipeBarrier<PIPE_V>();
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
+                AscendC::Cast(castUb_, accUb_, AscendC::RoundMode::CAST_RINT, rowNum * qkHeadDim);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
+                
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
+                AscendC::DataCopyExtParams outParams{rowNum, qkHeadDim * sizeof(float), 0, (headNum - 1) * qkHeadDim * sizeof(float), 0};
+                AscendC::DataCopyPad(dqGm_[dqOffset], castUb_, outParams);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
-                // Todo: read-back dqWorkspace_, Muls(scaleValue_), Cast, write dqGm_ at dqOffset
-                // ...
             }
             else if (existLast && existFirst) {
                 // Directly acc-UB Muls(scaleValue_), Cast, write dqGm_.
-                // ...
+                PipeBarrier<PIPE_V>();
+                AscendC::Muls(accUb_, accUb_, scaleValue_, rowNum * qkHeadDim);
+                PipeBarrier<PIPE_V>();
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
+                AscendC::Cast(castUb_, accUb_, AscendC::RoundMode::CAST_RINT, rowNum * qkHeadDim);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
+                
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
+                AscendC::DataCopyExtParams outParams{rowNum, qkHeadDim * sizeof(float), 0, (headNum - 1) * qkHeadDim * sizeof(float), 0};
+                AscendC::DataCopyPad(dqGm_[dqOffset], castUb_, outParams);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
             }
             else if (!existLast && existFirst) {
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
                 // Write acc-UB into dqWorkspace_.
                 uint64_t wsOffset = rowBegin * qkDimAlign_;
-                AscendC::DataCopyExtParams outParams{rowNum, qkHeadDim * sizeof(float), 0, (qkDimAlign_ - qkHeadDim) * sizeof(float), 0};
+                AscendC::DataCopyExtParams outWsParams{rowNum, qkHeadDim * sizeof(float), 0, (qkDimAlign_ - qkHeadDim) * sizeof(float), 0};
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
-                AscendC::DataCopyPad(dqWorkspace_[wsOffset], accUb_, outParams);
+                AscendC::DataCopyPad(dqWorkspace_[wsOffset], accUb_, outWsParams);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
             }
             else {
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
                 // Atomic add acc-UB into dqWorkspace_.
                 uint64_t wsOffset = rowBegin * qkDimAlign_;
-                AscendC::DataCopyExtParams outParams{rowNum, qkHeadDim * sizeof(float), 0, (qkDimAlign_ - qkHeadDim) * sizeof(float), 0};
+                AscendC::DataCopyExtParams outWsParams{rowNum, qkHeadDim * sizeof(float), 0, (qkDimAlign_ - qkHeadDim) * sizeof(float), 0};
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
                 AscendC::SetAtomicType<float>();
-                AscendC::DataCopyPad(dqWorkspace_[wsOffset], accUb_, outParams);
+                AscendC::DataCopyPad(dqWorkspace_[wsOffset], accUb_, outWsParams);
                 AscendC::SetAtomicNone();
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
             }
@@ -638,9 +667,10 @@ private:
     event_t eventAccUBMTE3ToMTE2 = 0;
     event_t eventAccUBMTE2ToV = 0;
     event_t eventAccUBVToMTE3 = 0;
-    // event_t eventAccUBVToV = 0;
     event_t eventInUBVToMTE2 = 0;
     event_t eventInUBMTE2ToV = 0;
+    event_t eventCastUBVToMTE3 = 0;
+    event_t eventCastUBMTE3ToV = 0;
 };
 
 }  // namespace Catlass::Epilogue::Block
