@@ -21,6 +21,7 @@
 #include "fag_epilogue_scaled_mask_softmax.hpp"
 #include "fag_epilogue_softmax_grad_front.hpp"
 #include "fag_epilogue_sub_mul.hpp"
+#include "fag_epilogue_deterministic_add.hpp"
 #include "kernel_operator.h"
 
 static constexpr uint32_t TASK_PINGPONG = 2;
@@ -259,6 +260,9 @@ public:
         epiloguePre_.Init(resource, params.workspace, params.tiling);
         epilogueSoftmaxGradFront_.Init(
             resource, params.dout, params.out, params.workspace,
+            params.tiling);
+        epilogueDetAdd_.Init(
+            resource, params.dq, params.dk, params.dv, params.workspace,
             params.tiling);
         epiloguePost_.Init(
             resource, params.dq, params.dk, params.dv, params.workspace,
@@ -719,7 +723,7 @@ private:
                 }
                 AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
-                ProcessVecDTMStage();
+                ProcessVecDTMStage(issueRound);
 #endif
                 AscendC::SyncAll<false>();
                 if (!moreRounds) {
@@ -1075,9 +1079,11 @@ private:
     }
     
     CATLASS_DEVICE
-    void ProcessVecDTMStage()
+    void ProcessVecDTMStage(uint32_t issueRound)
     {
-        
+        epilogueDetAdd_(
+            AscendC::GetBlockIdx(), issueRound, totalBlockNum_
+        );
     }
 #endif
 
@@ -1091,6 +1097,8 @@ private:
         TilingData> epilogueSoftmaxGradFront_;
     EpilogueScaledMaskSoftmax epilogueScaledMaskSoftmax_;
     EpilogueSubMul epilogueSubMul_;
+    Catlass::Epilogue::Block::FagDeterministicAdd<
+        DataType, Catlass::Arch::Ascend950, TilingData> epilogueDetAdd_;
     Catlass::Epilogue::Block::FagPost<
         DataType, Catlass::Arch::Ascend950, TilingData> epiloguePost_;
 #endif

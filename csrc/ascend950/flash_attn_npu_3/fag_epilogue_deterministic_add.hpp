@@ -65,7 +65,7 @@ struct KvEntry {
     uint64_t totalS2Start = 0;
 };
 
-CATLASS_DEVICE inline BatchShape GetBatchShape(
+CATLASS_DEVICE BatchShape GetBatchShape(
     const DecodeParams &p, uint32_t batchIdx)
 {
     BatchShape bs;
@@ -92,7 +92,7 @@ CATLASS_DEVICE inline BatchShape GetBatchShape(
 // Valid s2-block count of one s1 block.  Causal: kv col j is visible to q
 // row i iff j <= i + (s2Len - s1Len); the last visible col of the s1 block
 // is (s1BlockIdx + 1) * qBlk - 1 + (s2Len - s1Len).
-CATLASS_DEVICE inline uint32_t ValidS2BlockNum(
+CATLASS_DEVICE uint32_t ValidS2BlockNum(
     uint32_t s1Len, uint32_t s2Len, uint32_t s1BlockIdx,
     uint32_t qBlk, uint32_t kvBlk, bool isAttenMask)
 {
@@ -110,7 +110,7 @@ CATLASS_DEVICE inline uint32_t ValidS2BlockNum(
     return (lastBlk < s2BlockNum - 1 ? lastBlk : s2BlockNum - 1) + 1;
 }
 
-CATLASS_DEVICE inline uint32_t LastValidS2Block(
+CATLASS_DEVICE uint32_t LastValidS2Block(
     uint32_t s1Len, uint32_t s2Len, uint32_t s1BlockIdx,
     uint32_t qBlk, uint32_t kvBlk, bool isAttenMask)
 {
@@ -119,7 +119,7 @@ CATLASS_DEVICE inline uint32_t LastValidS2Block(
         s1Len, s2Len, s1BlockIdx, qBlk, kvBlk, isAttenMask) - 1;
 }
 
-CATLASS_DEVICE inline uint64_t CountValidS2Blocks(
+CATLASS_DEVICE uint64_t CountValidS2Blocks(
     uint32_t s1Len, uint32_t s2Len, uint32_t s1BlockNum,
     uint32_t qBlk, uint32_t kvBlk, bool isAttenMask)
 {
@@ -134,7 +134,7 @@ CATLASS_DEVICE inline uint64_t CountValidS2Blocks(
 // Rebuild the full task coordinates of one blockId from scratch
 // (b -> n2 -> s1 -> g -> s2).  Fills the same FAGBlockInfo the streaming
 // decoder produces.  O(batchNum + s1BlockNum) scalar work, no data movement.
-CATLASS_DEVICE inline bool DecodeBlockById(
+CATLASS_DEVICE bool DecodeBlockById(
     const DecodeParams &p, uint64_t blockId, FAGBlockInfo &out)
 {
     // ---- batch: accumulate per-batch block counts ----
@@ -422,7 +422,7 @@ private:
 
             // 1. Collect this chunk's (n2, s2BlockIdx) keys and det slots.
             //    slotId stays round-relative (= blockId % waveSize_), NOT chunk-relative.
-            KvEntry kvList[MAX_DTM_CHUNK_TASKS];
+            fag_det::KvEntry kvList[MAX_DTM_CHUNK_TASKS];
             uint32_t kvCount = 0;
             for (uint64_t blockId = chunkBegin; blockId < chunkEnd; ++blockId) {
                 FAGBlockInfo info;
@@ -438,7 +438,7 @@ private:
                 if (consumed & (1ULL << i)) {
                     continue;
                 }
-                KvEntry first = kvList[i];
+                fag_det::KvEntry first = kvList[i];
                 uint32_t rowNum = rowEnd - rowBegin;
                 if (rowBegin >= first.s2Extend) {
                     for (uint32_t j = i + 1; j < kvCount; ++j) {
@@ -457,7 +457,7 @@ private:
                 //     src: detGm[detOffset]
                 //     dst: accUb_
                 uint64_t detOffset = kvList[i].slotId * slotElems + rowBegin * dimAlign;
-                AscendC::DataCopyExtParams inParams{rowNum, headDim * sizeof(float), (dimAlign - headDim) * sizeof(float), 0, 0};
+                AscendC::DataCopyExtParams inParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(headDim * sizeof(float)), static_cast<int64_t>((dimAlign - headDim) * sizeof(float)), 0, 0};
                 AscendC::DataCopyPadExtParams<float> inPadParams{false, 0, 0, 0};
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
                 AscendC::DataCopyPad(accUb_, detGm[detOffset], inParams, inPadParams);
@@ -483,7 +483,7 @@ private:
                 //     src: accUb_
                 //     dst: wsGm[wsOffset]
                 uint64_t wsOffset = (first.totalS2Start * headNum + first.n2Idx) * headDim + rowBegin * headNum * headDim;
-                AscendC::DataCopyExtParams outParams{rowNum, headDim * sizeof(float), 0, (headNum - 1) * headDim * sizeof(float), 0};
+                AscendC::DataCopyExtParams outParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(headDim * sizeof(float)), 0, static_cast<int64_t>((headNum - 1) * headDim * sizeof(float)), 0};
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
                 AscendC::SetAtomicType<float>();
                 AscendC::DataCopyPad(wsGm[wsOffset], accUb_, outParams);
@@ -514,8 +514,8 @@ private:
         uint64_t blockEnd)
     {
         const uint32_t headNum = tiling_->qHeadNum;
+        const uint32_t qkHeadDim = tiling_->qkHeadDim;
         uint32_t headBlockId = blockBegin;
-        uint32_t rowNum = rowEnd - rowBegin;
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
@@ -524,6 +524,13 @@ private:
             if (!fag_det::DecodeBlockById(decodeParams_, headBlockId, headBlockInfo)) {
                 ++headBlockId;
                 continue;
+            }
+            uint32_t rowNum = rowEnd - rowBegin;
+            if (headBlockInfo.s1Extend <= rowBegin) {
+                ++headBlockId;
+                continue;
+            } else if (headBlockInfo.s1Extend < rowEnd) {
+                rowNum = headBlockInfo.s1Extend - rowBegin;
             }
             uint32_t lastValidS2Block = fag_det::LastValidS2Block(
                 headBlockInfo.curBatchS1, headBlockInfo.curBatchS2, 
@@ -535,7 +542,7 @@ private:
             // 1. Copy valid rows of the head Dq block from det-GM into acc-UB.
             uint32_t slotId = static_cast<uint32_t>(headBlockId - blockBegin);
             uint64_t detOffset = slotId * dqDetSlotElems_ + rowBegin * qkDimAlign_;
-            AscendC::DataCopyExtParams inParams{rowNum, qkHeadDim * sizeof(float), (qkDimAlign_ - qkHeadDim) * sizeof(float), 0, 0};
+            AscendC::DataCopyExtParams inParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(float)), static_cast<int64_t>((qkDimAlign_ - qkHeadDim) * sizeof(float)), 0, 0};
             AscendC::DataCopyPadExtParams<float> inPadParams{false, 0, 0, 0};
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
             AscendC::DataCopyPad(accUb_, dqDetWorkspaceGm_[detOffset], inParams, inPadParams);
@@ -569,7 +576,7 @@ private:
             if (existLast && !existFirst) {
                 // Read-back dqWorkspace_ into inUb_, then Add(accUb_, inUb_), Muls(scaleValue_), Cast, write dqGm_.
                 uint64_t wsOffset = rowBegin * qkDimAlign_;
-                AscendC::DataCopyExtParams inWsParams{rowNum, qkHeadDim * sizeof(float), (qkDimAlign_ - qkHeadDim) * sizeof(float), 0, 0};
+                AscendC::DataCopyExtParams inWsParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(float)), static_cast<int64_t>((qkDimAlign_ - qkHeadDim) * sizeof(float)), 0, 0};
                 AscendC::DataCopyPadExtParams<float> inWsPadParams{false, 0, 0, 0};
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
                 AscendC::DataCopyPad(inUb_, dqWorkspace_[wsOffset], inWsParams, inWsPadParams);
@@ -578,30 +585,30 @@ private:
                 AscendC::Add(accUb_, accUb_, inUb_, rowNum * qkHeadDim);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
                 
-                PipeBarrier<PIPE_V>();
+                AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Muls(accUb_, accUb_, scaleValue_, rowNum * qkHeadDim);
-                PipeBarrier<PIPE_V>();
+                AscendC::PipeBarrier<PIPE_V>();
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
                 AscendC::Cast(castUb_, accUb_, AscendC::RoundMode::CAST_RINT, rowNum * qkHeadDim);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
                 
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
-                AscendC::DataCopyExtParams outParams{rowNum, qkHeadDim * sizeof(float), 0, (headNum - 1) * qkHeadDim * sizeof(float), 0};
+                AscendC::DataCopyExtParams outParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(float)), 0, static_cast<int64_t>((headNum - 1) * qkHeadDim * sizeof(float)), 0};
                 AscendC::DataCopyPad(dqGm_[dqOffset], castUb_, outParams);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
             }
             else if (existLast && existFirst) {
                 // Directly acc-UB Muls(scaleValue_), Cast, write dqGm_.
-                PipeBarrier<PIPE_V>();
+                AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Muls(accUb_, accUb_, scaleValue_, rowNum * qkHeadDim);
-                PipeBarrier<PIPE_V>();
+                AscendC::PipeBarrier<PIPE_V>();
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
                 AscendC::Cast(castUb_, accUb_, AscendC::RoundMode::CAST_RINT, rowNum * qkHeadDim);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
                 
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
-                AscendC::DataCopyExtParams outParams{rowNum, qkHeadDim * sizeof(float), 0, (headNum - 1) * qkHeadDim * sizeof(float), 0};
+                AscendC::DataCopyExtParams outParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(float)), 0, static_cast<int64_t>((headNum - 1) * qkHeadDim * sizeof(float)), 0};
                 AscendC::DataCopyPad(dqGm_[dqOffset], castUb_, outParams);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
@@ -610,7 +617,7 @@ private:
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
                 // Write acc-UB into dqWorkspace_.
                 uint64_t wsOffset = rowBegin * qkDimAlign_;
-                AscendC::DataCopyExtParams outWsParams{rowNum, qkHeadDim * sizeof(float), 0, (qkDimAlign_ - qkHeadDim) * sizeof(float), 0};
+                AscendC::DataCopyExtParams outWsParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(float)), 0, static_cast<int64_t>((qkDimAlign_ - qkHeadDim) * sizeof(float)), 0};
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
                 AscendC::DataCopyPad(dqWorkspace_[wsOffset], accUb_, outWsParams);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
@@ -619,7 +626,7 @@ private:
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
                 // Atomic add acc-UB into dqWorkspace_.
                 uint64_t wsOffset = rowBegin * qkDimAlign_;
-                AscendC::DataCopyExtParams outWsParams{rowNum, qkHeadDim * sizeof(float), 0, (qkDimAlign_ - qkHeadDim) * sizeof(float), 0};
+                AscendC::DataCopyExtParams outWsParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(float)), 0, static_cast<int64_t>((qkDimAlign_ - qkHeadDim) * sizeof(float)), 0};
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventAccUBVToMTE3);
                 AscendC::SetAtomicType<float>();
                 AscendC::DataCopyPad(dqWorkspace_[wsOffset], accUb_, outWsParams);
@@ -664,13 +671,13 @@ private:
     uint64_t waveSize_ = 0;
     float scaleValue_ = 1.0f;
 
-    event_t eventAccUBMTE3ToMTE2 = 0;
-    event_t eventAccUBMTE2ToV = 0;
-    event_t eventAccUBVToMTE3 = 0;
-    event_t eventInUBVToMTE2 = 0;
-    event_t eventInUBMTE2ToV = 0;
-    event_t eventCastUBVToMTE3 = 0;
-    event_t eventCastUBMTE3ToV = 0;
+    event_t eventAccUBMTE3ToMTE2 = static_cast<event_t>(0);
+    event_t eventAccUBMTE2ToV = static_cast<event_t>(0);
+    event_t eventAccUBVToMTE3 = static_cast<event_t>(0);
+    event_t eventInUBVToMTE2 = static_cast<event_t>(0);
+    event_t eventInUBMTE2ToV = static_cast<event_t>(0);
+    event_t eventCastUBVToMTE3 = static_cast<event_t>(0);
+    event_t eventCastUBMTE3ToV = static_cast<event_t>(0);
 };
 
 }  // namespace Catlass::Epilogue::Block
