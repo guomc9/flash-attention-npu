@@ -101,6 +101,7 @@ CompileFlags:
     - "-D__NPU_ARCH__=3510"
     - "-DCATLASS_ARCH=3510"
     - "-D__DAV_VEC__"
+    - "-D__DAV_CUBE__"
     - "-isystem"
     - "../../../csrc/catlass/include"
     # kernel_common.hpp 等被包含式头缺少独立 include 上下文时由 catlass 宏头补齐
@@ -116,6 +117,7 @@ CompileFlags:
     - "-D__NPU_ARCH__=3510"
     - "-DCATLASS_ARCH=3510"
     - "-D__DAV_VEC__"
+    - "-D__DAV_CUBE__"
     - "-isystem"
     - "../../../../csrc/catlass/include"
     - "-include"
@@ -130,6 +132,7 @@ CompileFlags:
     - "-D__NPU_ARCH__=3510"
     - "-DCATLASS_ARCH=3510"
     - "-D__DAV_VEC__"
+    - "-D__DAV_CUBE__"
     - "-isystem"
     - "../../../csrc/catlass/include"
     - "-include"
@@ -144,6 +147,7 @@ CompileFlags:
     - "-D__NPU_ARCH__=3510"
     - "-DCATLASS_ARCH=3510"
     - "-D__DAV_VEC__"
+    - "-D__DAV_CUBE__"
     - "-isystem"
     - "../../../../csrc/catlass/include"
     - "-include"
@@ -151,6 +155,8 @@ CompileFlags:
 
 # ---- fai_kernel.cpp 使用 FAIKernelParams 但未自行包含其定义（真实构建中由
 #      fai_host_api_impl.hpp 先行包含 kernel_common.hpp），独立解析时预包含补齐 ----
+# 同时定义 __DAV_CUBE__/__DAV_VEC__ 后，cube/vec 分支在同一作用域重复声明
+# pvReadyFlag 等局部变量（真实构建 cube/vec 是两个独立 TU，无此冲突），抑制之
 ---
 If:
   PathMatch: "csrc/ascend950/.*/fai_kernel\\.cpp"
@@ -158,6 +164,9 @@ CompileFlags:
   Add:
     - "-include"
     - "kernel_common.hpp"
+Diagnostics:
+  Suppress:
+    - "redefinition"
 
 # ---- host 侧包含 <<<blocks, tiling, stream>>> 核启动语法的文件，clang 无法解析 ----
 ---

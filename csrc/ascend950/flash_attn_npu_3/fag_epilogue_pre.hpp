@@ -25,6 +25,7 @@ public:
         dvWorkspace_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(
             workspace + tiling_->dvOffset));
         zeroUb_ = resource.ubBuf.template GetBufferByByte<float>(0);
+        workspace_ = workspace;
     }
 
     CATLASS_DEVICE void operator()(
@@ -50,6 +51,10 @@ public:
         ClearRegion(dqWorkspace_, dqCount, vectorCoreId, vectorCoreNum);
         ClearRegion(dkWorkspace_, dkCount, vectorCoreId, vectorCoreNum);
         ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
+        if (vectorCoreId == 0) {
+            *workspace_ = 0;                         // readyCounter
+            *(workspace_ + sizeof(int64_t)) = 0;     // doneCounter
+        }
     }
 
 private:
@@ -87,6 +92,7 @@ private:
     }
 
     const __gm__ TilingData *tiling_ = nullptr;
+    GM_ADDR workspace_ = nullptr;
     AscendC::GlobalTensor<float> dqWorkspace_;
     AscendC::GlobalTensor<float> dkWorkspace_;
     AscendC::GlobalTensor<float> dvWorkspace_;
