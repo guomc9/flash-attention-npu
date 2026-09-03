@@ -37,7 +37,14 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3Event);
 
-        const uint64_t dqCount = static_cast<uint64_t>(tiling_->totalQ) * tiling_->qHeadNum * tiling_->qkHeadDim;
+        // dqPostAbsorb=1 (deterministic): the dq workspace is a single rolling
+        // tile (qTile x RoundUp(qkHeadDim,8) floats, see fag_tiling.cpp), NOT
+        // the full S1*N1 region.  Clearing the full count here would overrun
+        // into the dk/dv/delta regions and race with FagSoftmaxGradFront's
+        // delta writes (no barrier between the two epilogue calls).
+        const uint64_t dqCount = tiling_->dqPostAbsorb
+            ? static_cast<uint64_t>(tiling_->qTile) * ((tiling_->qkHeadDim + 7U) / 8U * 8U)
+            : static_cast<uint64_t>(tiling_->totalQ) * tiling_->qHeadNum * tiling_->qkHeadDim;
         const uint64_t dkCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->qkHeadDim;
         const uint64_t dvCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->vHeadDim;
         ClearRegion(dqWorkspace_, dqCount, vectorCoreId, vectorCoreNum);

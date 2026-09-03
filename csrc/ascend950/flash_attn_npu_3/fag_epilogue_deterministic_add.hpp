@@ -310,6 +310,15 @@ public:
             GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>());
         eventCastUBVToMTE3 = static_cast<event_t>(
             GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>());
+
+        // One-time buffer-free tokens: afterwards Set/Wait must strictly
+        // alternate (a second Set on an unconsumed flag deadlocks), which is
+        // why these cannot be re-armed inside ProcessDq/ProcessDkv on every
+        // round — the previous round's trailing Set pairs with the next
+        // round's first Wait.
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
     }
 
     CATLASS_DEVICE void operator()(
@@ -412,8 +421,6 @@ private:
         uint64_t blockEnd)
     {
         const uint32_t headNum = tiling_->kvHeadNum;
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
         // Chunk the round so the on-stack table and the 64-bit consumed bitmap always fit, however large the round gets.
         // A key split at a chunk boundary is reduced once per chunk; the fixed chunk order and disjoint per-core rows
         // keep the result deterministic.
@@ -516,9 +523,6 @@ private:
         const uint32_t headNum = tiling_->qHeadNum;
         const uint32_t qkHeadDim = tiling_->qkHeadDim;
         uint32_t headBlockId = blockBegin;
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
         while (headBlockId < blockEnd) {
             FAGBlockInfo headBlockInfo;
             if (!fag_det::DecodeBlockById(decodeParams_, headBlockId, headBlockInfo)) {
@@ -593,7 +597,7 @@ private:
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
                 
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
-                AscendC::DataCopyExtParams outParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(float)), 0, static_cast<int64_t>((headNum - 1) * qkHeadDim * sizeof(float)), 0};
+                AscendC::DataCopyExtParams outParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(DataType)), 0, static_cast<int64_t>((headNum - 1) * qkHeadDim * sizeof(DataType)), 0};
                 AscendC::DataCopyPad(dqGm_[dqOffset], castUb_, outParams);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
@@ -608,7 +612,7 @@ private:
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
                 
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventCastUBVToMTE3);
-                AscendC::DataCopyExtParams outParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(float)), 0, static_cast<int64_t>((headNum - 1) * qkHeadDim * sizeof(float)), 0};
+                AscendC::DataCopyExtParams outParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(DataType)), 0, static_cast<int64_t>((headNum - 1) * qkHeadDim * sizeof(DataType)), 0};
                 AscendC::DataCopyPad(dqGm_[dqOffset], castUb_, outParams);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventCastUBMTE3ToV);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);

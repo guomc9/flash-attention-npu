@@ -262,8 +262,8 @@ public:
             resource, params.dout, params.out, params.workspace,
             params.tiling);
         epilogueDetAdd_.Init(
-            resource, params.dq, params.dk, params.dv, params.workspace,
-            params.tiling);
+            resource, params.dq, params.cuSeqQlen, params.cuSeqKvlen,
+            params.workspace, params.tiling);
         epiloguePost_.Init(
             resource, params.dq, params.dk, params.dv, params.workspace,
             params.tiling);
