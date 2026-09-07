@@ -841,6 +841,7 @@ private:
                 ((block.blockId / waveSize_) & 1ULL) * waveSize_ +
                 (block.blockId % waveSize_);
             auto dv = MakeGmTensor(dvDetWorkspaceGm_,
+                detSlot * dvDetSlotElems_,
                 block.s2Extend, vHeadDim_, vHeadDimAlign_);
             mm345.ComputeDv(l1PTensor[slot], dy, dv,
                 Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
