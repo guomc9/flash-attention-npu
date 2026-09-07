@@ -216,6 +216,135 @@ CATLASS_DEVICE bool DecodeBlockById(
     return true;
 }
 
+
+// Stateful counterpart of DecodeBlockById. VecDTM scans monotonically
+// increasing blockIds across all rounds, so retaining batch/n2/s1 cursors
+// removes repeated O(batchNum + s1BlockNum) reconstruction from every task.
+// The emitted FAGBlockInfo exactly matches DecodeBlockById.
+class StreamingDecoder {
+public:
+    CATLASS_DEVICE void Init(const DecodeParams &p)
+    {
+        p_ = &p;
+        batchIdx_ = 0;
+        batchBegin_ = 0;
+        if (batchIdx_ < p_->batchNum) {
+            LoadBatch();
+        }
+    }
+
+    CATLASS_DEVICE bool Decode(uint64_t blockId, FAGBlockInfo &out)
+    {
+        while (batchIdx_ < p_->batchNum &&
+               blockId >= batchBegin_ + batchBlockNum_) {
+            batchBegin_ += batchBlockNum_;
+            ++batchIdx_;
+            if (batchIdx_ < p_->batchNum) {
+                LoadBatch();
+            }
+        }
+        if (batchIdx_ >= p_->batchNum || validPerN2_ == 0) {
+            return false;
+        }
+
+        const uint64_t blockInBatch = blockId - batchBegin_;
+        const uint64_t blocksPerN2 =
+            static_cast<uint64_t>(p_->groupNum) * validPerN2_;
+        const uint32_t n2Idx =
+            static_cast<uint32_t>(blockInBatch / blocksPerN2);
+        const uint64_t blockInN2 = blockInBatch % blocksPerN2;
+        if (n2Idx >= p_->kvHeadNum) {
+            return false;
+        }
+        if (n2Idx != n2Idx_) {
+            n2Idx_ = n2Idx;
+            s1BlockIdx_ = 0;
+            s1Begin_ = 0;
+        }
+
+        uint32_t validS2Num = 0;
+        while (s1BlockIdx_ < s1BlockNum_) {
+            validS2Num = ValidS2BlockNum(
+                bs_.s1Len, bs_.s2Len, s1BlockIdx_, p_->qBlockSize,
+                p_->kvBlockSize, p_->isAttenMask);
+            const uint64_t segment =
+                static_cast<uint64_t>(p_->groupNum) * validS2Num;
+            if (blockInN2 < s1Begin_ + segment) {
+                break;
+            }
+            s1Begin_ += segment;
+            ++s1BlockIdx_;
+        }
+        if (s1BlockIdx_ >= s1BlockNum_ || validS2Num == 0) {
+            return false;
+        }
+
+        const uint64_t blockInS1 = blockInN2 - s1Begin_;
+        const uint32_t groupIdx =
+            static_cast<uint32_t>(blockInS1 / validS2Num);
+        const uint32_t s2BlockIdx =
+            static_cast<uint32_t>(blockInS1 % validS2Num);
+        const uint32_t s1Start = s1BlockIdx_ * p_->qBlockSize;
+        const uint32_t s2Start = s2BlockIdx * p_->kvBlockSize;
+        const uint64_t totalS1Start = bs_.qStart + s1Start;
+        const uint64_t totalS2Start = bs_.kvStart + s2Start;
+        const uint64_t qHeadIdx =
+            static_cast<uint64_t>(n2Idx) * p_->groupNum + groupIdx;
+
+        out.blockId = blockId;
+        out.batchIdx = batchIdx_;
+        out.n2Idx = n2Idx;
+        out.groupIdx = groupIdx;
+        out.s1BlockIdx = s1BlockIdx_;
+        out.s2BlockIdx = s2BlockIdx;
+        out.s1Start = s1Start;
+        out.s2Start = s2Start;
+        out.curBatchS1 = bs_.s1Len;
+        out.curBatchS2 = bs_.s2Len;
+        out.s1Extend = (bs_.s1Len - s1Start < p_->qBlockSize)
+            ? bs_.s1Len - s1Start : p_->qBlockSize;
+        out.s2Extend = (bs_.s2Len - s2Start < p_->kvBlockSize)
+            ? bs_.s2Len - s2Start : p_->kvBlockSize;
+        out.totalS1Start = totalS1Start;
+        out.totalS2Start = totalS2Start;
+        out.qOffset =
+            (totalS1Start * p_->qHeadNum + qHeadIdx) * p_->qkHeadDim;
+        out.kOffset =
+            (totalS2Start * p_->kvHeadNum + n2Idx) * p_->qkHeadDim;
+        out.vOffset =
+            (totalS2Start * p_->kvHeadNum + n2Idx) * p_->vHeadDim;
+        out.doutOffset =
+            (totalS1Start * p_->qHeadNum + qHeadIdx) * p_->vHeadDim;
+        return true;
+    }
+
+private:
+    CATLASS_DEVICE void LoadBatch()
+    {
+        bs_ = GetBatchShape(*p_, batchIdx_);
+        s1BlockNum_ =
+            (bs_.s1Len + p_->qBlockSize - 1) / p_->qBlockSize;
+        validPerN2_ = CountValidS2Blocks(
+            bs_.s1Len, bs_.s2Len, s1BlockNum_, p_->qBlockSize,
+            p_->kvBlockSize, p_->isAttenMask);
+        batchBlockNum_ = static_cast<uint64_t>(p_->kvHeadNum) *
+            p_->groupNum * validPerN2_;
+        n2Idx_ = 0;
+        s1BlockIdx_ = 0;
+        s1Begin_ = 0;
+    }
+
+    const DecodeParams *p_ = nullptr;
+    BatchShape bs_;
+    uint32_t batchIdx_ = 0;
+    uint32_t n2Idx_ = 0;
+    uint32_t s1BlockIdx_ = 0;
+    uint32_t s1BlockNum_ = 0;
+    uint64_t batchBegin_ = 0;
+    uint64_t batchBlockNum_ = 0;
+    uint64_t validPerN2_ = 0;
+    uint64_t s1Begin_ = 0;
+};
 }  // namespace fag_det
 
 // ---------------------------------------------------------------------------
@@ -288,6 +417,7 @@ public:
             static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL);
         decodeParams_.cuSeqQ = cuSeqQGm_;
         decodeParams_.cuSeqKv = cuSeqKvGm_;
+        streamDecoder_.Init(decodeParams_);
 
         // UB: accumulation buffer + incoming tile buffer (+ dq cast buffer).
         accUb_ = resource.ubBuf.template GetBufferByByte<float>(0);
@@ -433,7 +563,7 @@ private:
             uint32_t kvCount = 0;
             for (uint64_t blockId = chunkBegin; blockId < chunkEnd; ++blockId) {
                 FAGBlockInfo info;
-                if (!fag_det::DecodeBlockById(decodeParams_, blockId, info)) {
+                if (!streamDecoder_.Decode(blockId, info)) {
                     continue;
                 }
                 kvList[kvCount++] = {info.n2Idx, info.s2BlockIdx, info.s2Extend, static_cast<uint32_t>(blockId - blockBegin), info.totalS2Start};
@@ -522,16 +652,24 @@ private:
     {
         const uint32_t headNum = tiling_->qHeadNum;
         const uint32_t qkHeadDim = tiling_->qkHeadDim;
-        uint32_t headBlockId = blockBegin;
-        while (headBlockId < blockEnd) {
+        uint64_t nextBlockId = blockBegin;
+        bool hasPendingBlock = false;
+        FAGBlockInfo pendingBlockInfo;
+        while (nextBlockId < blockEnd || hasPendingBlock) {
             FAGBlockInfo headBlockInfo;
-            if (!fag_det::DecodeBlockById(decodeParams_, headBlockId, headBlockInfo)) {
-                ++headBlockId;
-                continue;
+            uint64_t headBlockId;
+            if (hasPendingBlock) {
+                headBlockInfo = pendingBlockInfo;
+                headBlockId = headBlockInfo.blockId;
+                hasPendingBlock = false;
+            } else {
+                headBlockId = nextBlockId++;
+                if (!streamDecoder_.Decode(headBlockId, headBlockInfo)) {
+                    continue;
+                }
             }
             uint32_t rowNum = rowEnd - rowBegin;
             if (headBlockInfo.s1Extend <= rowBegin) {
-                ++headBlockId;
                 continue;
             } else if (headBlockInfo.s1Extend < rowEnd) {
                 rowNum = headBlockInfo.s1Extend - rowBegin;
@@ -541,7 +679,6 @@ private:
                 headBlockInfo.s1BlockIdx, decodeParams_.qBlockSize, decodeParams_.kvBlockSize, decodeParams_.isAttenMask);
             bool existFirst = (headBlockInfo.s2BlockIdx == 0);
             bool existLast = (headBlockInfo.s2BlockIdx == lastValidS2Block);
-            uint32_t nextBlockId = headBlockId + 1;
 
             // 1. Copy valid rows of the head Dq block from det-GM into acc-UB.
             uint32_t slotId = static_cast<uint32_t>(headBlockId - blockBegin);
@@ -554,17 +691,19 @@ private:
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventAccUBMTE2ToV);
             while (nextBlockId < blockEnd)
             {
+                const uint64_t currentBlockId = nextBlockId++;
                 FAGBlockInfo nextBlockInfo;
-                if (!fag_det::DecodeBlockById(decodeParams_, nextBlockId, nextBlockInfo)) {
-                    ++nextBlockId;
+                if (!streamDecoder_.Decode(currentBlockId, nextBlockInfo)) {
                     continue;
                 }
                 if (nextBlockInfo.groupIdx != headBlockInfo.groupIdx || nextBlockInfo.totalS1Start != headBlockInfo.totalS1Start 
                      || nextBlockInfo.n2Idx != headBlockInfo.n2Idx) {
+                    pendingBlockInfo = nextBlockInfo;
+                    hasPendingBlock = true;
                     break;
                 }
                 // 2. Copy valid rows of the next Dq block from det-GM into acc-UB, then Add(accUb_, accUb_, inUb_).
-                uint32_t nextSlotId = static_cast<uint32_t>(nextBlockId - blockBegin);
+                uint32_t nextSlotId = static_cast<uint32_t>(currentBlockId - blockBegin);
                 uint64_t nextDetOffset = nextSlotId * dqDetSlotElems_ + rowBegin * qkDimAlign_;
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
                 AscendC::DataCopyPad(inUb_, dqDetWorkspaceGm_[nextDetOffset], inParams, inPadParams);
@@ -573,7 +712,6 @@ private:
                 AscendC::Add(accUb_, accUb_, inUb_, rowNum * qkHeadDim);
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
                 existLast |= (nextBlockInfo.s2BlockIdx == lastValidS2Block);
-                ++nextBlockId;
             }
             // 3. Write acc-UB into dqGm_ or dqWorkspace_ according to the 4 branches.
             uint64_t dqOffset = headBlockInfo.qOffset + rowBegin * headNum * qkHeadDim;
@@ -637,7 +775,6 @@ private:
                 AscendC::SetAtomicNone();
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventAccUBMTE3ToMTE2);
             }
-            headBlockId = nextBlockId;
         }
         return;
     }
@@ -667,6 +804,7 @@ private:
     AscendC::LocalTensor<DataType> castUb_;
 
     fag_det::DecodeParams decodeParams_;
+    fag_det::StreamingDecoder streamDecoder_;
     uint64_t qkDimAlign_ = 0;
     uint64_t dvDimAlign_ = 0;
     uint64_t dqDetSlotElems_ = 0;
