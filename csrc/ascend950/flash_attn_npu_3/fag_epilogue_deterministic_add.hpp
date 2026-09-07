@@ -19,6 +19,7 @@
 #define FLASH_ATTN_NPU_ASCEND950_V3_FAG_EPILOGUE_DETERMINISTIC_ADD_HPP
 
 #include "catlass/arch/resource.hpp"
+#include "catlass/detail/alignment.hpp"
 #include "fag_common.h"
 #include "kernel_operator.h"
 
@@ -219,10 +220,11 @@ CATLASS_DEVICE bool DecodeBlockById(
 }  // namespace fag_det
 
 // ---------------------------------------------------------------------------
-// VecDTM epilogue.  One call per issue round, between the two round-end
-// SyncAll barriers in RunTasks (v1).  UB is borrowed from the main pipeline's
-// buffers: at this point the round's V1/V2 have all completed and the next
-// round has not started, so the UB window is safe.
+// VecDTM epilogue.  One call per issue round, at the round-end sync point in
+// RunTasks.  UB is a dedicated tail-of-UB region owned by this epilogue (see
+// Init): the main pipeline's ping/pong halves CANNOT be borrowed whenever
+// VecDTM(r) overlaps the next round's C12, whose SPLIT_M fixpipe writes them
+// while an absorb may still be in flight.
 // ---------------------------------------------------------------------------
 template <typename DataType, class ArchTag, class TilingData>
 class FagDeterministicAdd {
@@ -251,10 +253,6 @@ public:
             workspace + tiling_->dvDetOffset));
         cuSeqQGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(cuSeqQ));
         cuSeqKvGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(cuSeqKv));
-        // Round-sync counters, v2 only (v1 uses SyncAll instead):
-        // readyCounter @ workspace+0, doneCounter @ workspace+8.
-        readyCounter_ = workspace;
-        doneCounter_ = workspace + sizeof(int64_t);
 
         // Det slot geometry: slot = qTile/kvTile rows of RoundUp(dim, 8)
         // floats; must match fag_tiling.cpp and the C345/C5 write side.
@@ -290,11 +288,38 @@ public:
         decodeParams_.cuSeqKv = cuSeqKvGm_;
 
         // UB: accumulation buffer + incoming tile buffer (+ dq cast buffer).
-        accUb_ = resource.ubBuf.template GetBufferByByte<float>(0);
-        inUb_ = resource.ubBuf.template GetBufferByByte<float>(
-            TILE_FLOATS * sizeof(float));
-        castUb_ = resource.ubBuf.template GetBufferByByte<DataType>(
-            2U * TILE_FLOATS * sizeof(float));
+        // Dedicated tail-of-UB region, NOT borrowed from the main pipeline:
+        // v2 overlaps VecDTM(r) with the next round's C12, whose SPLIT_M
+        // fixpipe writes the ping/pong halves (mm1Res/mm2Res start at UB+0),
+        // so borrowing them lets C12 clobber an in-flight absorb.  Each core
+        // only reduces its own row slice (rows / groupSize), so a few KB per
+        // buffer suffice; fag_tiling.cpp checks the budget against ubSize.
+        if (tiling_->dqVecNum != 0 && tiling_->dkVecNum != 0 &&
+            tiling_->dvVecNum != 0) {
+            const uint32_t rowCapDq =
+                (tiling_->qTile + tiling_->dqVecNum - 1U) / tiling_->dqVecNum;
+            const uint32_t rowCapDk =
+                (tiling_->kvTile + tiling_->dkVecNum - 1U) / tiling_->dkVecNum;
+            const uint32_t rowCapDv =
+                (tiling_->kvTile + tiling_->dvVecNum - 1U) / tiling_->dvVecNum;
+            uint32_t rowCap = rowCapDq;
+            if (rowCapDk > rowCap) { rowCap = rowCapDk; }
+            if (rowCapDv > rowCap) { rowCap = rowCapDv; }
+            const uint64_t colCap =
+                qkDimAlign_ > dvDimAlign_ ? qkDimAlign_ : dvDimAlign_;
+            const uint64_t accBytes = RoundUp<32>(
+                static_cast<uint64_t>(rowCap) * colCap * sizeof(float));
+            const uint64_t castBytes = RoundUp<32>(
+                static_cast<uint64_t>(rowCap) * tiling_->qkHeadDim *
+                sizeof(DataType));
+            const uint64_t ubSize = tiling_->ubSize;
+            accUb_ = resource.ubBuf.template GetBufferByByte<float>(
+                ubSize - 2U * accBytes - castBytes);
+            inUb_ = resource.ubBuf.template GetBufferByByte<float>(
+                ubSize - accBytes - castBytes);
+            castUb_ = resource.ubBuf.template GetBufferByByte<DataType>(
+                ubSize - castBytes);
+        }
 
         eventAccUBMTE3ToMTE2 = static_cast<event_t>(
             GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
@@ -386,8 +411,6 @@ public:
 
 private:
     enum class Group : uint32_t { DQ = 0, DK = 1, DV = 2 };
-
-    static constexpr uint32_t TILE_FLOATS = 20U * 1024U;
 
     // Chunk size for the round scan: the on-stack task table and the 64-bit
     // consumed bitmap below cover one chunk; rounds larger than this are
@@ -653,15 +676,13 @@ private:
     AscendC::GlobalTensor<float> dvDetWorkspaceGm_;
     AscendC::GlobalTensor<int32_t> cuSeqQGm_;
     AscendC::GlobalTensor<int32_t> cuSeqKvGm_;
-    GM_ADDR readyCounter_ = nullptr;   // v2
-    GM_ADDR doneCounter_ = nullptr;    // v2
 
-    // UB buffers borrowed from the main pipeline (round-end SyncAll makes the
-    // window safe).  accUb_/inUb_ are shared by ProcessDq and ProcessDkv: a
-    // core belongs to exactly one group per round, so the two paths are
-    // mutually exclusive and never live at once; reuse ordering within each
-    // path is guarded by the event_* flags below.  castUb_ is dq-only (Cast
-    // result before writing dqGm_).
+    // UB buffers owned by this epilogue (dedicated tail-of-UB region, safe
+    // under the v2 C12/VecDTM overlap).  accUb_/inUb_ are shared by ProcessDq
+    // and ProcessDkv: a core belongs to exactly one group per round, so the
+    // two paths are mutually exclusive and never live at once; reuse ordering
+    // within each path is guarded by the event_* flags below.  castUb_ is
+    // dq-only (Cast result before writing dqGm_).
     AscendC::LocalTensor<float> accUb_;
     AscendC::LocalTensor<float> inUb_;
     AscendC::LocalTensor<DataType> castUb_;

@@ -125,6 +125,7 @@ public:
         qBlockSize_ = tiling_->qTile;
         kvBlockSize_ = tiling_->kvTile;
         coreNum_ = tiling_->usedCoreNum;
+        dtmVecCoreNum_ = tiling_->dqVecNum + tiling_->dkVecNum + tiling_->dvVecNum;
         continuousBlockNum_ = tiling_->continuousBlockNum;
         waveSize_ =
             static_cast<uint64_t>(coreNum_) * continuousBlockNum_;
@@ -613,6 +614,37 @@ private:
         return true;
     }
 
+    CATLASS_DEVICE int64_t GmAtomicAdd(GM_ADDR addr, int64_t value)
+    {
+        return AscendC::AtomicAdd((__gm__ int64_t*)addr, value);
+    }
+
+    CATLASS_DEVICE void GmPollGe(GM_ADDR addr, int64_t target)
+    {
+        // Poll with an atomic RMW: scalar GM loads go through this core's
+        // DCache and would never observe the other cores' L2 atomics.
+        // AtomicAdd(addr, 0) executes at L2 and returns the current value.
+        // Unbounded by design: the ready/done protocol is deadlock-free when
+        // the counts are right; a broken count must surface as an aicore
+        // timeout, not as silent numeric corruption.
+        auto *counter = reinterpret_cast<__gm__ int64_t *>(addr);
+        while (AscendC::AtomicAdd(counter, (int64_t)0) < target) {
+        }
+    }
+
+    CATLASS_DEVICE int64_t ReadyTarget(uint32_t issueRound)
+    {
+        if (issueRound + 1 < totalRounds_) {
+            return static_cast<int64_t>(issueRound + 1) * coreNum_;
+        }
+        // Final round: only the cores that still have tasks add to the
+        // readyCounter, i.e. ceil(tail / continuousBlockNum_) of them.
+        const uint64_t tail =
+            totalBlockNum_ - (totalRounds_ - 1) * waveSize_;
+        return static_cast<int64_t>(totalRounds_ - 1) * coreNum_ +
+            (tail + continuousBlockNum_ - 1) / continuousBlockNum_;
+    }
+
     CATLASS_DEVICE
     void RunTasks(
         uint32_t coreIdx,
@@ -642,6 +674,7 @@ private:
             // the last task's back-end, so the deferred in-loop processing
             // only triggers for lanes > 0 and no cross-round state is kept.
             [[maybe_unused]] bool roundHasTask = false;
+            bool detSlotChecked = false;
             for (uint32_t issueLane = 0;
                  issueLane < continuousBlockNum_; ++issueLane) {
                 FAGBlockInfo block{};
@@ -688,6 +721,13 @@ private:
                 ProcessC1Stage(block, mm12);
                 ProcessC2Stage(block, mm12);
                 if (hasPendingPrev) {
+                    // DTM v2: ProcessVecDTMStage(r) & C12(r+1) overlap
+                    if constexpr (IS_DTM) {
+                        if (!detSlotChecked) {
+                            GmPollGe(detDoneCounter_, (int64_t)dtmVecCoreNum_ * issueRound);
+                            detSlotChecked = true;
+                        }
+                    }
                     ProcessC5Stage(previousBlock_, true, mm345);
                     ProcessC34Stage(previousBlock_, true, mm345);
                 }
@@ -705,27 +745,39 @@ private:
             }
 
             if constexpr (IS_DTM) {
-                // v1: flush this round's last back-end task, then
-                // barrier -> VecDTM fixed-order reduction -> barrier.
                 const bool moreRounds = issueRound + 1 < totalRounds_;
                 if (roundHasTask) {
-                    // The final round has no following task, so its L1
-                    // buffers do not need to be returned (same as the
-                    // non-DTM drain path).
 #ifdef __DAV_CUBE__
+                    // DTM v2: the first det-slot overwrite of this round may
+                    // happen here (single-task round); VecDTM(r-1) must be done.
+                    if (!detSlotChecked) {
+                        GmPollGe(detDoneCounter_, (int64_t)dtmVecCoreNum_ * issueRound);
+                        detSlotChecked = true;
+                    }
                     ProcessC5Stage(previousBlock_, moreRounds, mm345);
                     ProcessC34Stage(previousBlock_, moreRounds, mm345);
+                    // DTM v2: ProcessVecDTMStage(r) & C12(r+1) overlap.
+                    // Reclaim this round's FIX_M tokens, then count the round
+                    // into detReadyCounter_ so the DTM vec cores may start
+                    // absorbing this round's det slots.
+                    DrainFixPipeEvents();
+                    GmAtomicAdd(detReadyCounter_, 1);
 #endif
 #ifdef __DAV_VEC__
                     ProcessV1Stage(previousBlock_, subBlockIdx);
                     ProcessV2Stage(previousBlock_, subBlockIdx);
 #endif
                 }
-                AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
-                ProcessVecDTMStage(issueRound);
+                // DTM v2: DTM vec cores wait until all cube cores published
+                // this round's det slots, absorb them in fixed order, then
+                // count into detDoneCounter_ (gates the next slot reuse).
+                if (AscendC::GetBlockIdx() < dtmVecCoreNum_) {
+                    GmPollGe(detReadyCounter_, ReadyTarget(issueRound));
+                    ProcessVecDTMStage(issueRound);
+                    GmAtomicAdd(detDoneCounter_, 1);
+                }
 #endif
-                AscendC::SyncAll<false>();
                 if (!moreRounds) {
 #ifdef __DAV_CUBE__
                     WaitCubeEvents();
@@ -773,6 +825,25 @@ private:
              eventId < Catlass::Gemm::Ascend950FagL0CLayout::L0C_SLOT_NUM;
              ++eventId) {
             AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(eventId);
+        }
+    }
+
+    CATLASS_DEVICE
+    void DrainFixPipeEvents()
+    {
+        // IS_DTM round end: confirm this core's fixpipes (det-slot writes)
+        // have all landed in GM.  The FIX pipe completes in issue order,
+        // so waiting the latest FIX_M flag per L0C slot covers the whole
+        // round.  Tokens are re-set immediately: the pipeline continues.
+        for (uint32_t eventId = 0;
+            eventId < Catlass::Gemm::Ascend950FagL0CLayout::L0C_SLOT_NUM;
+            ++eventId) {
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(eventId);
+        }
+        for (uint32_t eventId = 0;
+            eventId < Catlass::Gemm::Ascend950FagL0CLayout::L0C_SLOT_NUM;
+            ++eventId) {
+            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(eventId);
         }
     }
 
@@ -1170,6 +1241,7 @@ private:
     uint32_t qBlockSize_ = 0;
     uint32_t kvBlockSize_ = 0;
     uint32_t coreNum_ = 0;
+    uint32_t dtmVecCoreNum_ = 0;
     uint32_t continuousBlockNum_ = 0;
     uint64_t waveSize_ = 0;
     float scaleValue_ = 1.0f;

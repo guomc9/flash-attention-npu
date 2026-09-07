@@ -52,8 +52,12 @@ public:
         ClearRegion(dkWorkspace_, dkCount, vectorCoreId, vectorCoreNum);
         ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
         if (vectorCoreId == 0) {
-            *workspace_ = 0;                         // readyCounter
-            *(workspace_ + sizeof(int64_t)) = 0;     // doneCounter
+            // GM_ADDR is __gm__ uint8_t*: cast to int64_t to zero the FULL
+            // counters, and use atomics so the zeroing is visible at L2 —
+            // a scalar store could sit in this core's DCache and never reach
+            // the L2 where the v2 AtomicAdd/poll operate.
+            AscendC::AtomicExch(reinterpret_cast<__gm__ uint64_t *>(workspace_), (uint64_t)0);                   // readyCounter
+            AscendC::AtomicExch(reinterpret_cast<__gm__ uint64_t *>(workspace_ + sizeof(uint64_t)), (uint64_t)0); // doneCounter
         }
     }
 

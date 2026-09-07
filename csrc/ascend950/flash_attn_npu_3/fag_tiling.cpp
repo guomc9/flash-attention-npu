@@ -7,6 +7,7 @@
 #include "fag_common.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 
 namespace FAGTiling950 {
@@ -18,6 +19,11 @@ constexpr uint64_t FP32_ROW_ALIGN = 8;  // 32B alignment in float elements
 uint64_t RoundUpU64(uint64_t value, uint64_t align)
 {
     return (value + align - 1) / align * align;
+}
+
+uint64_t CeilDivU64(uint64_t value, uint64_t divisor)
+{
+    return (value + divisor - 1) / divisor;
 }
 
 }  // namespace
@@ -89,6 +95,54 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
     // dq accumulates into a single rolling tile when dqPostAbsorb=1, into the
     // full S1*N1 region otherwise.  det slots: aicNum * continuousBlockNum
     // tiles per gradient, compact row-major with an aligned row stride.
+
+    // UB budget check.  The main pipeline owns two ping/pong halves starting
+    // at UB+0 (formula mirrors fag_kernel.cpp Init); the VecDTM epilogue owns
+    // a dedicated tail region (mirrors fag_epilogue_deterministic_add.hpp
+    // Init).  Borrowing is NOT allowed: v2 overlaps VecDTM(r) with the next
+    // round's C12 SPLIT_M fixpipe, which writes the ping/pong halves.
+    // The v2 done-counter target and the VecDTM group mapping assume the
+    // three vec groups all exist as physical AIVs.
+    if (info.dqVecNum == 0 || info.dkVecNum == 0 || info.dvVecNum == 0 ||
+        info.dqVecNum + info.dkVecNum + info.dvVecNum > info.aivNum) {
+        fprintf(stderr,
+            "FAG950 det bwd: bad vec groups %u/%u/%u (aivNum %u)\n",
+            info.dqVecNum, info.dkVecNum, info.dvVecNum, info.aivNum);
+        return -1;
+    }
+    const uint64_t rowsPerSub = RoundUpU64(tiling.qTile, 16) / 2;
+    const uint64_t mmResBytes = rowsPerSub * tiling.kvTile * FP32_BYTES;
+    const uint64_t attenMaskBytes = rowsPerSub * tiling.kvTile;
+    const uint64_t lseBytes =
+        RoundUpU64(rowsPerSub, 8) * 8 * FP32_BYTES;
+    const uint64_t pBytes = (rowsPerSub + 1) * tiling.kvTile * 2;
+    const uint64_t deltaBytes = rowsPerSub * 8 * FP32_BYTES;
+    const uint64_t lseOff = RoundUpU64(2 * mmResBytes + attenMaskBytes, 32);
+    const uint64_t pOff = RoundUpU64(lseOff + lseBytes, 32);
+    const uint64_t dSOff = RoundUpU64(pOff + pBytes, 32);
+    const uint64_t deltaOff = RoundUpU64(dSOff + pBytes, 32);
+    const uint64_t halfUb = RoundUpU64(deltaOff + deltaBytes, 32);
+    const uint64_t pipelineUb = 2 * halfUb;  // TASK_PINGPONG
+    const uint64_t rowCapDq = CeilDivU64(tiling.qTile, info.dqVecNum);
+    const uint64_t rowCapDk = CeilDivU64(tiling.kvTile, info.dkVecNum);
+    const uint64_t rowCapDv = CeilDivU64(tiling.kvTile, info.dvVecNum);
+    uint64_t rowCap = rowCapDq;
+    if (rowCapDk > rowCap) { rowCap = rowCapDk; }
+    if (rowCapDv > rowCap) { rowCap = rowCapDv; }
+    const uint64_t colCap = dAlign > dvAlign ? dAlign : dvAlign;
+    const uint64_t accUbBytes =
+        RoundUpU64(rowCap * colCap * FP32_BYTES, 32);
+    const uint64_t castUbBytes =
+        RoundUpU64(rowCap * info.qkHeadDim * 2, 32);
+    const uint64_t detAddUb = 2 * accUbBytes + castUbBytes;
+    if (pipelineUb + detAddUb > info.ubSize) {
+        fprintf(stderr,
+            "FAG950 det bwd: UB too small: pipeline %llu + VecDTM %llu > %llu\n",
+            (unsigned long long)pipelineUb, (unsigned long long)detAddUb,
+            (unsigned long long)info.ubSize);
+        return -1;
+    }
+
     const uint64_t dqWsSize = tiling.dqPostAbsorb
         ? static_cast<uint64_t>(tiling.qTile) * dAlign * FP32_BYTES
         : tiling.totalQ * tiling.qHeadNum * dAlign * FP32_BYTES;
