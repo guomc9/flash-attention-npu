@@ -640,12 +640,25 @@ private:
             // IS_DTM: whether this core issued any task in this round.
             // Round-local by construction: the round-end flush below consumes
             // the last task's back-end, so the deferred in-loop processing
-            // only triggers for lanes > 0 and no cross-round state is kept.
+            // only triggers for lanes > 0.  The only cross-round state is
+            // preIssuedBlock_: the next round's lane-0 task, decoded and
+            // front-end-issued between the round-end barriers.
             [[maybe_unused]] bool roundHasTask = false;
             for (uint32_t issueLane = 0;
                  issueLane < continuousBlockNum_; ++issueLane) {
                 FAGBlockInfo block{};
-                if (!DecodeBlock(blockBegin + issueLane, block)) {
+                // IS_DTM: lane 0 was decoded and C1/C2-issued at the previous
+                // round's end (overlap with VecDTM); reuse the stashed block.
+                bool preIssuedHere = false;
+                if constexpr (IS_DTM) {
+                    preIssuedHere = issueLane == 0 && preIssued_;
+                    if (preIssuedHere) {
+                        block = preIssuedBlock_;
+                        preIssued_ = false;
+                    }
+                }
+                if (!preIssuedHere &&
+                    !DecodeBlock(blockBegin + issueLane, block)) {
                     if constexpr (IS_DTM) {
                         // No more tasks for this core in this round.  The
                         // pending back-end is flushed at the round end below;
@@ -672,9 +685,11 @@ private:
                         return;
                     }
                 }
-                block.taskId = taskId;
-                block.issueRound = issueRound;
-                block.issueLane = issueLane;
+                if (!preIssuedHere) {
+                    block.taskId = taskId;
+                    block.issueRound = issueRound;
+                    block.issueLane = issueLane;
+                }
 
                 // IS_DTM: at lane 0 previousBlock_ is the previous round's
                 // last task, whose back-end was already flushed at that
@@ -685,8 +700,10 @@ private:
 #ifdef __DAV_CUBE__
                 // Front-end MM of task i overlaps the vector and back-end MM
                 // stages of task i - 1.
-                ProcessC1Stage(block, mm12);
-                ProcessC2Stage(block, mm12);
+                if (!preIssuedHere) {
+                    ProcessC1Stage(block, mm12);
+                    ProcessC2Stage(block, mm12);
+                }
                 if (hasPendingPrev) {
                     ProcessC5Stage(previousBlock_, true, mm345);
                     ProcessC34Stage(previousBlock_, true, mm345);
@@ -722,6 +739,26 @@ private:
 #endif
                 }
                 AscendC::SyncAll<false>();
+                // Overlap: decode and front-end-issue the next round's
+                // lane-0 task here, so its C1/C2 fly on the AIC pipes while
+                // the AIVs run VecDTM.  C1/C2 consume only GM inputs
+                // (q/k/dy/v) and write UB mm1Res/mm2Res[taskId % 2]; V1/V2
+                // stay flag-guarded (C1_TO_V1/C2_TO_V2), and VecDTM's UB is
+                // its own tail region, disjoint from the in-flight SPLIT_M
+                // fixpipe writes.  The streaming decoder stays monotonic:
+                // lane 0 of the next round consumes the stashed block.
+                preIssued_ = false;
+                if (moreRounds &&
+                    DecodeBlock(blockBegin + waveSize_, preIssuedBlock_)) {
+                    preIssuedBlock_.taskId = taskId;
+                    preIssuedBlock_.issueRound = issueRound + 1;
+                    preIssuedBlock_.issueLane = 0;
+                    preIssued_ = true;
+#ifdef __DAV_CUBE__
+                    ProcessC1Stage(preIssuedBlock_, mm12);
+                    ProcessC2Stage(preIssuedBlock_, mm12);
+#endif
+                }
 #ifdef __DAV_VEC__
                 ProcessVecDTMStage(issueRound);
 #endif
@@ -1195,6 +1232,10 @@ private:
     uint64_t decoderValidS2PerN2_ = 0;
 
     FAGBlockInfo previousBlock_{};
+    // IS_DTM overlap: next round's lane-0 task, decoded and C1/C2-issued
+    // between the round-end SyncAll barriers; consumed at the next lane 0.
+    FAGBlockInfo preIssuedBlock_{};
+    bool preIssued_ = false;
 };
 
 template <
