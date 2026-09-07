@@ -108,10 +108,6 @@ public:
                 (__gm__ float *)(params.workspace + tiling_->dkDetOffset));
             dvDetWorkspaceGm_.SetGlobalBuffer(
                 (__gm__ float *)(params.workspace + tiling_->dvDetOffset));
-            // Sync area sits at the workspace start: readyCounter @ +0,
-            // doneCounter @ +8 (see MULTI_CORE_SYNC_BYTES layout).
-            detReadyCounter_ = params.workspace;
-            detDoneCounter_ = params.workspace + sizeof(int64_t);
         }
 
         batchNum_ = static_cast<uint32_t>(tiling_->batch);
@@ -615,23 +611,6 @@ private:
         return true;
     }
 
-    CATLASS_DEVICE int64_t GmAtomicAdd(GM_ADDR addr, int64_t value)
-    {
-        return AscendC::AtomicAdd((__gm__ int64_t*)addr, value);
-    }
-
-    CATLASS_DEVICE void GmPollGe(GM_ADDR addr, int64_t target)
-    {
-        // Poll with an atomic RMW: scalar GM loads go through this core's
-        // DCache and would never observe the other cores' L2 atomics.
-        // AtomicAdd(addr, 0) executes at L2 and returns the current value.
-        // Unbounded by design: a broken count must surface as an aicore
-        // timeout, not as silent numeric corruption.
-        auto *counter = reinterpret_cast<__gm__ int64_t *>(addr);
-        while (AscendC::AtomicAdd(counter, (int64_t)0) < target) {
-        }
-    }
-
     CATLASS_DEVICE
     void RunTasks(
         uint32_t coreIdx,
@@ -661,9 +640,6 @@ private:
             // the last task's back-end, so the deferred in-loop processing
             // only triggers for lanes > 0 and no cross-round state is kept.
             [[maybe_unused]] bool roundHasTask = false;
-            // IS_DTM: the done-counter wait below is needed at most once per
-            // round, before this core's first det-slot write of the round.
-            bool detSlotChecked = false;
             for (uint32_t issueLane = 0;
                  issueLane < continuousBlockNum_; ++issueLane) {
                 FAGBlockInfo block{};
@@ -710,19 +686,6 @@ private:
                 ProcessC1Stage(block, mm12);
                 ProcessC2Stage(block, mm12);
                 if (hasPendingPrev) {
-                    // DTM: the back-end below writes this round's det slots
-                    // (slot = blockId % waveSize_); VecDTM(issueRound-1) must
-                    // have finished reading them.  AIV-side MTE2 reads
-                    // complete locally before the done atomic, so a GM
-                    // counter suffices here — no barrier needed.
-                    if constexpr (IS_DTM) {
-                        if (!detSlotChecked) {
-                            GmPollGe(detDoneCounter_,
-                                static_cast<int64_t>(dtmVecCoreNum_) *
-                                    issueRound);
-                            detSlotChecked = true;
-                        }
-                    }
                     ProcessC5Stage(previousBlock_, true, mm345);
                     ProcessC34Stage(previousBlock_, true, mm345);
                 }
@@ -740,25 +703,17 @@ private:
             }
 
             if constexpr (IS_DTM) {
-                // Single round-end barrier + done counter: SyncAll publishes
-                // this round's det-slot fixpipe writes to every core (the
-                // only proven cross-core publication point on this chip),
-                // then VecDTM(r) overlaps the next round's whole pipeline.
-                // Slot reuse is gated by detDoneCounter_ at the write side
-                // (see the back-end paths above), so no second barrier.
+                // SyncAll publishes this round's det-slot fixpipe writes to
+                // every core (the only proven cross-core publication point on
+                // this chip). Det slots are banked by round parity, so
+                // VecDTM(r) can read its bank while C345(r+1) writes the other
+                // bank; r+2 cannot reuse r's bank until VecDTM(r) has returned.
                 const bool moreRounds = issueRound + 1 < totalRounds_;
                 if (roundHasTask) {
                     // The final round has no following task, so its L1
                     // buffers do not need to be returned (same as the
                     // non-DTM drain path).
 #ifdef __DAV_CUBE__
-                    // A single-task round writes its det slots here, so the
-                    // done wait may not have happened in-loop yet.
-                    if (!detSlotChecked) {
-                        GmPollGe(detDoneCounter_,
-                            static_cast<int64_t>(dtmVecCoreNum_) * issueRound);
-                        detSlotChecked = true;
-                    }
                     ProcessC5Stage(previousBlock_, moreRounds, mm345);
                     ProcessC34Stage(previousBlock_, moreRounds, mm345);
 #endif
@@ -771,7 +726,6 @@ private:
 #ifdef __DAV_VEC__
                 if (AscendC::GetBlockIdx() < dtmVecCoreNum_) {
                     ProcessVecDTMStage(issueRound);
-                    GmAtomicAdd(detDoneCounter_, 1);
                 }
 #endif
                 if (!moreRounds) {
@@ -881,10 +835,12 @@ private:
         auto dy = MakeGmTensor(doutGm_, block.doutOffset, block.s1Extend,
             vHeadDim_, qHeadNum_ * vHeadDim_);
         if constexpr (IS_DTM) {
-            // Compact det slot: index = coreIdx * cbn + issueLane,
-            // stride/row-step use the aligned head dim (matches tiling).
+            // Compact det slot: round-parity bank plus coreIdx * cbn + lane.
+            // Stride/row-step use the aligned head dim (matches tiling).
+            const uint64_t detSlot =
+                ((block.blockId / waveSize_) & 1ULL) * waveSize_ +
+                (block.blockId % waveSize_);
             auto dv = MakeGmTensor(dvDetWorkspaceGm_,
-                (block.blockId % waveSize_) * dvDetSlotElems_,
                 block.s2Extend, vHeadDim_, vHeadDimAlign_);
             mm345.ComputeDv(l1PTensor[slot], dy, dv,
                 Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
@@ -923,7 +879,8 @@ private:
             qkHeadDim_, qHeadNum_ * qkHeadDim_);
         if constexpr (IS_DTM) {
             const uint64_t detSlot =
-                block.blockId % waveSize_;  // = coreIdx * cbn + issueLane
+                ((block.blockId / waveSize_) & 1ULL) * waveSize_ +
+                (block.blockId % waveSize_);
             auto dq = MakeGmTensor(dqDetWorkspaceGm_,
                 detSlot * dqDetSlotElems_,
                 block.s1Extend, qkHeadDim_, qkHeadDimAlign_);
@@ -1169,8 +1126,6 @@ private:
     AscendC::GlobalTensor<float> dkDetWorkspaceGm_;
     AscendC::GlobalTensor<float> dvDetWorkspaceGm_;
     
-    GM_ADDR detReadyCounter_ = nullptr;
-    GM_ADDR detDoneCounter_ = nullptr;
     // Det slot geometry (fp32 elements) and uniform round count (IS_DTM).
     uint64_t qkHeadDimAlign_ = 0;
     uint64_t vHeadDimAlign_ = 0;

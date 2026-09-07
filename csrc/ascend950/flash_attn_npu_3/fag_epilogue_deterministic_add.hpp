@@ -254,8 +254,9 @@ public:
         cuSeqQGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(cuSeqQ));
         cuSeqKvGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(cuSeqKv));
 
-        // Det slot geometry: slot = qTile/kvTile rows of RoundUp(dim, 8)
-        // floats; must match fag_tiling.cpp and the C345/C5 write side.
+        // Det slot geometry: two banks of waveSize slots, each slot containing
+        // qTile/kvTile rows of RoundUp(dim, 8) floats. Must match
+        // fag_tiling.cpp and the C345/C5 write side.
         qkDimAlign_ = (tiling_->qkHeadDim + 7U) / 8U * 8U;
         dvDimAlign_ = (tiling_->vHeadDim + 7U) / 8U * 8U;
         dqDetSlotElems_ =
@@ -396,16 +397,18 @@ public:
         }
 
         // ---- 4. per-group reduction ----
+        const uint64_t slotBankBase =
+            static_cast<uint64_t>(issueRound & 1U) * waveSize_;
         if (group == Group::DQ) {
-            ProcessDq(rowBegin, rowEnd, blockBegin, blockEnd);
+            ProcessDq(rowBegin, rowEnd, blockBegin, blockEnd, slotBankBase);
         } else if (group == Group::DK) {
             ProcessDkv(dkDetWorkspaceGm_, dkWorkspace_, dkDetSlotElems_,
                 qkDimAlign_, tiling_->qkHeadDim,
-                rowBegin, rowEnd, blockBegin, blockEnd);
+                rowBegin, rowEnd, blockBegin, blockEnd, slotBankBase);
         } else {
             ProcessDkv(dvDetWorkspaceGm_, dvWorkspace_, dvDetSlotElems_,
                 dvDimAlign_, tiling_->vHeadDim,
-                rowBegin, rowEnd, blockBegin, blockEnd);
+                rowBegin, rowEnd, blockBegin, blockEnd, slotBankBase);
         }
     }
 
@@ -425,7 +428,7 @@ private:
     //   2. acc = slot(accumList[0]) rows [rowBegin,rowEnd); for each further
     //      member: DataCopyPad into inUb_, Add(accUb_, accUb_, inUb_);
     //      slot addr = detBase + slotId * slotElems + rowBegin * dimAlign
-    //      with slotId = blockId % waveSize_ (round-relative);
+    //      with slotId = slotBankBase + (blockId - blockBegin);
     //   3. SetAtomicType<float>() + DataCopyPad into ws at
     //      (totalS2Start * kvHeadNum + n2) * headDim
     //      + rowBegin * kvHeadNum * headDim, then SetAtomicNone().
@@ -441,7 +444,8 @@ private:
         uint32_t rowBegin,
         uint32_t rowEnd,
         uint64_t blockBegin,
-        uint64_t blockEnd)
+        uint64_t blockEnd,
+        uint64_t slotBankBase)
     {
         const uint32_t headNum = tiling_->kvHeadNum;
         // Chunk the round so the on-stack table and the 64-bit consumed bitmap always fit, however large the round gets.
@@ -459,7 +463,8 @@ private:
                 if (!fag_det::DecodeBlockById(decodeParams_, blockId, info)) {
                     continue;
                 }
-                kvList[kvCount++] = {info.n2Idx, info.s2BlockIdx, info.s2Extend, static_cast<uint32_t>(blockId - blockBegin), info.totalS2Start};
+                kvList[kvCount++] = {info.n2Idx, info.s2BlockIdx, info.s2Extend,
+                    static_cast<uint32_t>(slotBankBase + blockId - blockBegin), info.totalS2Start};
             }
 
             // 2. Collect kv entries for each unique (n2, s2BlockIdx) pair.
@@ -541,7 +546,8 @@ private:
         uint32_t rowBegin,
         uint32_t rowEnd,
         uint64_t blockBegin,
-        uint64_t blockEnd)
+        uint64_t blockEnd,
+        uint64_t slotBankBase)
     {
         const uint32_t headNum = tiling_->qHeadNum;
         const uint32_t qkHeadDim = tiling_->qkHeadDim;
@@ -554,8 +560,8 @@ private:
             }
             uint32_t rowNum = rowEnd - rowBegin;
             if (headBlockInfo.s1Extend <= rowBegin) {
-                ++headBlockId;
                 continue;
+                ++headBlockId;
             } else if (headBlockInfo.s1Extend < rowEnd) {
                 rowNum = headBlockInfo.s1Extend - rowBegin;
             }
@@ -567,7 +573,8 @@ private:
             uint32_t nextBlockId = headBlockId + 1;
 
             // 1. Copy valid rows of the head Dq block from det-GM into acc-UB.
-            uint32_t slotId = static_cast<uint32_t>(headBlockId - blockBegin);
+            uint32_t slotId = static_cast<uint32_t>(
+                slotBankBase + headBlockId - blockBegin);
             uint64_t detOffset = slotId * dqDetSlotElems_ + rowBegin * qkDimAlign_;
             AscendC::DataCopyExtParams inParams{static_cast<uint16_t>(rowNum), static_cast<uint32_t>(qkHeadDim * sizeof(float)), static_cast<int64_t>((qkDimAlign_ - qkHeadDim) * sizeof(float)), 0, 0};
             AscendC::DataCopyPadExtParams<float> inPadParams{false, 0, 0, 0};
@@ -587,7 +594,8 @@ private:
                     break;
                 }
                 // 2. Copy valid rows of the next Dq block from det-GM into acc-UB, then Add(accUb_, accUb_, inUb_).
-                uint32_t nextSlotId = static_cast<uint32_t>(nextBlockId - blockBegin);
+                uint32_t nextSlotId = static_cast<uint32_t>(
+                    slotBankBase + nextBlockId - blockBegin);
                 uint64_t nextDetOffset = nextSlotId * dqDetSlotElems_ + rowBegin * qkDimAlign_;
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eventInUBVToMTE2);
                 AscendC::DataCopyPad(inUb_, dqDetWorkspaceGm_[nextDetOffset], inParams, inPadParams);

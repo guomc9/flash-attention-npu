@@ -93,16 +93,18 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
     // Deterministic layout:
     //   [sync 64KB][dq][dk][dv][delta][dqDet][dkDet][dvDet]
     // dq accumulates into a single rolling tile when dqPostAbsorb=1, into the
-    // full S1*N1 region otherwise.  det slots: aicNum * continuousBlockNum
-    // tiles per gradient, compact row-major with an aligned row stride.
+    // full S1*N1 region otherwise. det slots reserve two complete issue
+    // rounds (aicNum * continuousBlockNum tiles per round) per gradient.
+    // Alternating the round bank lets VecDTM(r) read one bank while C345(r+1)
+    // writes the other, without a done-counter gate on slot reuse.
 
     // UB budget check.  The main pipeline owns two ping/pong halves starting
     // at UB+0 (formula mirrors fag_kernel.cpp Init); the VecDTM epilogue owns
     // a dedicated tail region (mirrors fag_epilogue_deterministic_add.hpp
     // Init).  Borrowing is NOT allowed: v2 overlaps VecDTM(r) with the next
     // round's C12 SPLIT_M fixpipe, which writes the ping/pong halves.
-    // The v2 done-counter target and the VecDTM group mapping assume the
-    // three vec groups all exist as physical AIVs.
+    // The VecDTM group mapping assumes the three vec groups all exist as
+    // physical AIVs.
     if (info.dqVecNum == 0 || info.dkVecNum == 0 || info.dvVecNum == 0 ||
         info.dqVecNum + info.dkVecNum + info.dvVecNum > info.aivNum) {
         fprintf(stderr,
@@ -150,7 +152,8 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
     const uint64_t dvWsSize = tiling.totalKv * tiling.kvHeadNum * dvAlign * FP32_BYTES;
     const uint64_t deltaWsSize = tiling.totalQ * tiling.qHeadNum * 8;
 
-    const uint64_t slotNum =
+    constexpr uint64_t detSlotBanks = 2;
+    const uint64_t slotNum = detSlotBanks *
         static_cast<uint64_t>(info.aicNum) * info.continuousBlockNum;
     const uint64_t dqDetSize = RoundUpU64(
         slotNum * tiling.qTile * dAlign * FP32_BYTES, GM_ALIGNMENT);

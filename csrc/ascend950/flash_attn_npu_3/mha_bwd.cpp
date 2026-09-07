@@ -130,9 +130,9 @@ mha_bwd(
     // into three fixed groups of 16 (dq/dk/dv). Heuristics are TBD.
     fag_info.dqPostAbsorb = deterministic ? 1U : 0U;
     if (deterministic) {
-        fag_info.dqVecNum = 16;
-        fag_info.dkVecNum = 16;
-        fag_info.dvVecNum = 16;
+        fag_info.dqVecNum = 8;
+        fag_info.dkVecNum = 8;
+        fag_info.dvVecNum = 8;
     }
     fag_info.batch = batch_size;
     fag_info.qSeqlen = q_seqlen;
