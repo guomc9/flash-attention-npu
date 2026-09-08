@@ -560,8 +560,8 @@ private:
             }
             uint32_t rowNum = rowEnd - rowBegin;
             if (headBlockInfo.s1Extend <= rowBegin) {
-                continue;
                 ++headBlockId;
+                continue;
             } else if (headBlockInfo.s1Extend < rowEnd) {
                 rowNum = headBlockInfo.s1Extend - rowBegin;
             }
