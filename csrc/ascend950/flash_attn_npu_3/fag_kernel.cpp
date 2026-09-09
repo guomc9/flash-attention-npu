@@ -685,21 +685,21 @@ private:
                 // stages of task i - 1.
                 ProcessC1Stage(block, mm12);
                 ProcessC2Stage(block, mm12);
-                if constexpr (IS_DTM) {
-                    // C12(r+1) is issued before this barrier; lane 0 has no
-                    // V12/C345 predecessor, so no r+1 consumer has started.
-                    // Skip the final partial round because inactive cores
-                    // there cannot join a matched SyncAll call.
-                    if (issueLane == 0 && issueRound != 0 &&
-                        issueRound + 1 < totalRounds_) {
-                        AscendC::SyncAll<false>();
-                    }
-                }
                 if (hasPendingPrev) {
                     ProcessC5Stage(previousBlock_, true, mm345);
                     ProcessC34Stage(previousBlock_, true, mm345);
                 }
 #endif
+                if constexpr (IS_DTM) {
+                    // All Cube cores have completed C12(r+1) here.  Lane 0
+                    // has no predecessor, so neither V12 nor C345(r+1) has
+                    // begun; all Cube/AIV cores must enter this barrier.
+                    // Skip the final partial round: inactive cores cannot
+                    // participate in a matched per-lane SyncAll.
+                    if (issueLane == 0 && issueRound != 0 &&
+                        issueRound + 1 < totalRounds_) {
+                        AscendC::SyncAll<false>();
+                    }
 #ifdef __DAV_VEC__
                 if (hasPendingPrev) {
                     ProcessV1Stage(previousBlock_, subBlockIdx);
