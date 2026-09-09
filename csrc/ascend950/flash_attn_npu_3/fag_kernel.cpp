@@ -686,18 +686,6 @@ private:
                 ProcessC1Stage(block, mm12);
                 ProcessC2Stage(block, mm12);
 #endif
-                if constexpr (IS_DTM) {
-                    // CBN=2: lane 1 is reached only after both C12 tiles of
-                    // r+1 have issued. C345/V12 then consume lane 0, so this
-                    // is the required C12(r+1) -> V12(r+1) cut. Other CBNs
-                    // retain v2 semantics; final partial rounds cannot join.
-                    if (continuousBlockNum_ == 2 &&
-                        issueLane + 1 == continuousBlockNum_ && issueRound != 0 &&
-                        issueRound + 1 < totalRounds_) {
-                        AscendC::PipeBarrier<PIPE_ALL>();
-                        AscendC::SyncAll<false>();
-                    }
-                }
 #ifdef __DAV_CUBE__
                 if (hasPendingPrev) {
                     ProcessC5Stage(previousBlock_, true, mm345);
