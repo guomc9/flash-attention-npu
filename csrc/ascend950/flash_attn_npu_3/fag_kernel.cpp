@@ -687,12 +687,12 @@ private:
                 ProcessC2Stage(block, mm12);
 #endif
                 if constexpr (IS_DTM) {
-                    // All Cube cores have completed C12(r+1) here.  Lane 0
-                    // has no predecessor, so neither V12 nor C345(r+1) has
-                    // begun; all Cube/AIV cores must enter this barrier.
-                    // Skip the final partial round: inactive cores cannot
-                    // participate in a matched per-lane SyncAll.
-                    if (issueLane == 0 && issueRound != 0 &&
+                    // CBN=2: lane 1 is reached only after both C12 tiles of
+                    // r+1 have issued. C345/V12 then consume lane 0, so this
+                    // is the required C12(r+1) -> V12(r+1) cut. Other CBNs
+                    // retain v2 semantics; final partial rounds cannot join.
+                    if (continuousBlockNum_ == 2 &&
+                        issueLane + 1 == continuousBlockNum_ && issueRound != 0 &&
                         issueRound + 1 < totalRounds_) {
                         AscendC::PipeBarrier<PIPE_ALL>();
                         AscendC::SyncAll<false>();
