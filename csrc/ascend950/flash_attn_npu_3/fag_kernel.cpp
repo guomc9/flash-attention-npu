@@ -685,11 +685,13 @@ private:
                 // predecessor.
                 const bool hasPendingPrev =
                     IS_DTM ? (issueLane != 0) : (taskId != 0);
+                const bool deferC12Publish =
+                    IS_DTM && issueLane == 0 && issueRound != 0;
 #ifdef __DAV_CUBE__
                 // Front-end MM of task i overlaps the vector and back-end MM
                 // stages of task i - 1.
-                ProcessC1Stage(block, mm12);
-                ProcessC2Stage(block, mm12);
+                ProcessC1Stage(block, mm12, !deferC12Publish);
+                ProcessC2Stage(block, mm12, !deferC12Publish);
 #endif
                 if constexpr (IS_DTM) {
                     // Sync #2: DTM(r) and C12(r+1) converge before V12(r+1).
@@ -698,6 +700,11 @@ private:
                         AscendC::SyncAll<false>();
                     }
                 }
+#ifdef __DAV_CUBE__
+                if (deferC12Publish) {
+                    PublishC12Stage(block);
+                }
+#endif
 #ifdef __DAV_CUBE__
                 if (hasPendingPrev) {
                     ProcessC5Stage(previousBlock_, true, mm345);
@@ -793,7 +800,7 @@ private:
     }
 
     CATLASS_DEVICE
-    void ProcessC1Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12)
+    void ProcessC1Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12, bool publish)
     {
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         const uint16_t flagId = SYNC_C1_TO_V1_FLAG[slot];
@@ -808,13 +815,14 @@ private:
             ubMm1ResTensor[slot], sLayout, Catlass::Arch::PositionUB{});
         mm12(q, k, s, Catlass::GemmCoord(
             block.s1Extend, block.s2Extend, qkHeadDim_));
+        if (!publish) return;
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
             flagId + V0_V1_FLAG_ID_OFFSET);
     }
 
     CATLASS_DEVICE
-    void ProcessC2Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12)
+    void ProcessC2Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12, bool publish)
     {
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         const uint16_t flagId = SYNC_C2_TO_V2_FLAG[slot];
@@ -829,9 +837,24 @@ private:
             ubMm2ResTensor[slot], dpLayout, Catlass::Arch::PositionUB{});
         mm12(dy, v, dp, Catlass::GemmCoord(
             block.s1Extend, block.s2Extend, vHeadDim_));
+        if (!publish) return;
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
             flagId + V0_V1_FLAG_ID_OFFSET);
+    }
+
+    CATLASS_DEVICE
+    void PublishC12Stage(FAGBlockInfo const &block)
+    {
+        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint16_t c1FlagId = SYNC_C1_TO_V1_FLAG[slot];
+        const uint16_t c2FlagId = SYNC_C2_TO_V2_FLAG[slot];
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(c1FlagId);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
+            c1FlagId + V0_V1_FLAG_ID_OFFSET);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(c2FlagId);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
+            c2FlagId + V0_V1_FLAG_ID_OFFSET);
     }
 
     CATLASS_DEVICE
