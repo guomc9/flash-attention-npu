@@ -685,10 +685,6 @@ private:
                 // stages of task i - 1.
                 ProcessC1Stage(block, mm12);
                 ProcessC2Stage(block, mm12);
-                if (hasPendingPrev) {
-                    ProcessC5Stage(previousBlock_, true, mm345);
-                    ProcessC34Stage(previousBlock_, true, mm345);
-                }
 #endif
                 if constexpr (IS_DTM) {
                     // All Cube cores have completed C12(r+1) here.  Lane 0
@@ -700,6 +696,11 @@ private:
                         issueRound + 1 < totalRounds_) {
                         AscendC::SyncAll<false>();
                     }
+                }
+#ifdef __DAV_CUBE__
+                if (hasPendingPrev) {
+                    ProcessC5Stage(previousBlock_, true, mm345);
+                    ProcessC34Stage(previousBlock_, true, mm345);
                 }
 #ifdef __DAV_VEC__
                 if (hasPendingPrev) {
