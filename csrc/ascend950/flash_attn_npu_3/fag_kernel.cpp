@@ -655,6 +655,7 @@ private:
 #ifdef __DAV_VEC__
                             PrepareV12Stage();
 #endif
+                            AscendC::PipeBarrier<PIPE_ALL>();
                             AscendC::SyncAll<false>();
                         }
                         break;
@@ -711,6 +712,7 @@ private:
                         // scalar-side issue completion.
                         AscendC::PipeBarrier<PIPE_FIX>();
 #endif
+                        AscendC::PipeBarrier<PIPE_ALL>();
                         AscendC::SyncAll<false>();
                     }
                 }
