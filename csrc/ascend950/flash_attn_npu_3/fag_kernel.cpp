@@ -700,6 +700,7 @@ private:
                         issueRound + 1 < totalRounds_) {
                         AscendC::SyncAll<false>();
                     }
+                }
 #ifdef __DAV_VEC__
                 if (hasPendingPrev) {
                     ProcessV1Stage(previousBlock_, subBlockIdx);
