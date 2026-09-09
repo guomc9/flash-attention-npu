@@ -703,6 +703,7 @@ private:
                     ProcessC34Stage(previousBlock_, true, mm345);
                 }
 #ifdef __DAV_VEC__
+#endif
                 if (hasPendingPrev) {
                     ProcessV1Stage(previousBlock_, subBlockIdx);
                     ProcessV2Stage(previousBlock_, subBlockIdx);
