@@ -693,6 +693,16 @@ private:
                 }
 #endif
 #ifdef __DAV_VEC__
+                if constexpr (IS_DTM) {
+                    // CBN=2 lane 1 has completed both C12 tiles and C345 for
+                    // lane 0. C345 releases shared MM12/C345 resources, so it
+                    // must precede the cut; V12(lane 0) follows the cut.
+                    if (continuousBlockNum_ == 2 &&
+                        issueLane + 1 == continuousBlockNum_ && issueRound != 0 &&
+                        issueRound + 1 < totalRounds_) {
+                        AscendC::PipeBarrier<PIPE_ALL>();
+                        AscendC::SyncAll<false>();
+                    }
                 if (hasPendingPrev) {
                     ProcessV1Stage(previousBlock_, subBlockIdx);
                     ProcessV2Stage(previousBlock_, subBlockIdx);
