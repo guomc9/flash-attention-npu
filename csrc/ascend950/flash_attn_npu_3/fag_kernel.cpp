@@ -652,6 +652,9 @@ private:
                         // In a partial final round, cores without lane 0 must
                         // still match active cores' C12-to-V12 sync #2.
                         if (issueLane == 0 && issueRound != 0) {
+#ifdef __DAV_VEC__
+                            PrepareV12Stage();
+#endif
                             AscendC::SyncAll<false>();
                         }
                         break;
@@ -697,6 +700,11 @@ private:
                     // Sync #2: DTM(r) and C12(r+1) converge before V12(r+1).
                     // Round 0 has no preceding DTM and needs no second sync.
                     if (issueLane == 0 && issueRound != 0) {
+#ifdef __DAV_VEC__
+                        // Consume C345(r)'s ownership-return handshakes before
+                        // entering the cross-round barrier.
+                        PrepareV12Stage();
+#endif
                         AscendC::SyncAll<false>();
                     }
                 }
@@ -992,6 +1000,15 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(dSVWaitMte3Ping);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(dSVWaitMte3Pong);
     }
+    CATLASS_DEVICE
+    void PrepareV12Stage()
+    {
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
+            SYNC_C5_TO_V1_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
+            SYNC_C34_TO_V2_FLAG);
+    }
+
 
     CATLASS_DEVICE
     void ProcessV1Stage(
@@ -1005,7 +1022,8 @@ private:
 
         // Before task 1 and later overwrite P in L1, C5 must return ownership
         // of the buffer used by the preceding task.
-        if (block.taskId != 0) {
+        if (block.taskId != 0 &&
+            !(IS_DTM && block.issueLane == 0 && block.issueRound != 0)) {
             AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
                 SYNC_C5_TO_V1_FLAG);
         }
@@ -1086,7 +1104,8 @@ private:
 
         // Before task 1 and later overwrite dS in L1, C3/C4 must return
         // ownership of the buffer used by the preceding task.
-        if (block.taskId != 0) {
+        if (block.taskId != 0 &&
+            !(IS_DTM && block.issueLane == 0 && block.issueRound != 0)) {
             AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
                 SYNC_C34_TO_V2_FLAG);
         }
