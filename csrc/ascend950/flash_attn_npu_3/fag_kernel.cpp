@@ -698,12 +698,12 @@ private:
                     }
                 }
 #ifdef __DAV_CUBE__
-#ifdef __DAV_CUBE__
                 if (hasPendingPrev) {
                     ProcessC5Stage(previousBlock_, true, mm345);
                     ProcessC34Stage(previousBlock_, true, mm345);
                 }
 #endif
+#ifdef __DAV_VEC__
                 if (hasPendingPrev) {
                     ProcessV1Stage(previousBlock_, subBlockIdx);
                     ProcessV2Stage(previousBlock_, subBlockIdx);
