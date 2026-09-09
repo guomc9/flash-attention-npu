@@ -697,7 +697,7 @@ private:
                         AscendC::SyncAll<false>();
                     }
                 }
-#ifdef __DAV_VEC__
+#ifdef __DAV_CUBE__
 #ifdef __DAV_CUBE__
                 if (hasPendingPrev) {
                     ProcessC5Stage(previousBlock_, true, mm345);
