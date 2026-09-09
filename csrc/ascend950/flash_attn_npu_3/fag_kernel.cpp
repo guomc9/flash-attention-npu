@@ -705,6 +705,12 @@ private:
                         // entering the cross-round barrier.
                         PrepareV12Stage();
 #endif
+#ifdef __DAV_CUBE__
+                        // ProcessC1/2 enqueue their UB writes on FixPipe.  The
+                        // second SyncAll must observe C12 completion, not only
+                        // scalar-side issue completion.
+                        AscendC::PipeBarrier<PIPE_FIX>();
+#endif
                         AscendC::SyncAll<false>();
                     }
                 }
@@ -1007,6 +1013,9 @@ private:
             SYNC_C5_TO_V1_FLAG);
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
             SYNC_C34_TO_V2_FLAG);
+        // CrossCoreWaitFlag is enqueued on MTE3.  Drain that queue here so the
+        // ownership tokens are consumed before the scalar-side SyncAll.
+        AscendC::PipeBarrier<PIPE_MTE3>();
     }
 
 
