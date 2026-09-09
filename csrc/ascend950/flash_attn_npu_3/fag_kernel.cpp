@@ -694,6 +694,7 @@ private:
                     // participate in a matched per-lane SyncAll.
                     if (issueLane == 0 && issueRound != 0 &&
                         issueRound + 1 < totalRounds_) {
+                        AscendC::PipeBarrier<PIPE_ALL>();
                         AscendC::SyncAll<false>();
                     }
                 }
