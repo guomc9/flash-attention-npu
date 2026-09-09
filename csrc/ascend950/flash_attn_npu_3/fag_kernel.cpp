@@ -649,6 +649,15 @@ private:
                         // pending back-end is flushed at the round end below;
                         // every core still joins the round barriers so the
                         // SyncAll counts stay matched across cores.
+                        // In a partial final round, cores without lane 0 must
+                        // still match active cores' C12-to-V12 sync #2.
+                        if (issueLane == 0 && issueRound != 0) {
+#ifdef __DAV_VEC__
+                            PrepareV12Stage();
+#endif
+                            AscendC::PipeBarrier<PIPE_ALL>();
+                            AscendC::SyncAll<false>();
+                        }
                         break;
                     } else {
                         if (taskId != 0) {
@@ -680,31 +689,45 @@ private:
                 // predecessor.
                 const bool hasPendingPrev =
                     IS_DTM ? (issueLane != 0) : (taskId != 0);
+                const bool deferC12Publish =
+                    IS_DTM && issueLane == 0 && issueRound != 0;
 #ifdef __DAV_CUBE__
                 // Front-end MM of task i overlaps the vector and back-end MM
                 // stages of task i - 1.
-                ProcessC1Stage(block, mm12);
-                ProcessC2Stage(block, mm12);
+                ProcessC1Stage(block, mm12, !deferC12Publish);
+                ProcessC2Stage(block, mm12, !deferC12Publish);
 #endif
                 if constexpr (IS_DTM) {
-                    // CBN=2: lane 1 is reached only after both C12 tiles of
-                    // r+1 have issued. C345/V12 then consume lane 0, so this
-                    // is the required C12(r+1) -> V12(r+1) cut. Other CBNs
-                    // retain v2 semantics; final partial rounds cannot join.
-                    if (continuousBlockNum_ == 2 &&
-                        issueLane + 1 == continuousBlockNum_ && issueRound != 0 &&
-                        issueRound + 1 < totalRounds_) {
+                    // Sync #2: DTM(r) and C12(r+1) converge before V12(r+1).
+                    // Round 0 has no preceding DTM and needs no second sync.
+                    if (issueLane == 0 && issueRound != 0) {
+#ifdef __DAV_VEC__
+                        // Consume C345(r)'s ownership-return handshakes before
+                        // entering the cross-round barrier.
+                        PrepareV12Stage();
+#endif
+#ifdef __DAV_CUBE__
+                        // ProcessC1/2 enqueue their UB writes on FixPipe.  The
+                        // second SyncAll must observe C12 completion, not only
+                        // scalar-side issue completion.
+                        AscendC::PipeBarrier<PIPE_FIX>();
+#endif
                         AscendC::PipeBarrier<PIPE_ALL>();
                         AscendC::SyncAll<false>();
                     }
                 }
 #ifdef __DAV_CUBE__
+                if (deferC12Publish) {
+                    PublishC12Stage(block);
+                }
+#endif
+#ifdef __DAV_CUBE__
                 if (hasPendingPrev) {
                     ProcessC5Stage(previousBlock_, true, mm345);
                     ProcessC34Stage(previousBlock_, true, mm345);
                 }
-#ifdef __DAV_VEC__
 #endif
+#ifdef __DAV_VEC__
                 if (hasPendingPrev) {
                     ProcessV1Stage(previousBlock_, subBlockIdx);
                     ProcessV2Stage(previousBlock_, subBlockIdx);
@@ -793,7 +816,7 @@ private:
     }
 
     CATLASS_DEVICE
-    void ProcessC1Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12)
+    void ProcessC1Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12, bool publish)
     {
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         const uint16_t flagId = SYNC_C1_TO_V1_FLAG[slot];
@@ -808,13 +831,14 @@ private:
             ubMm1ResTensor[slot], sLayout, Catlass::Arch::PositionUB{});
         mm12(q, k, s, Catlass::GemmCoord(
             block.s1Extend, block.s2Extend, qkHeadDim_));
+        if (!publish) return;
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
             flagId + V0_V1_FLAG_ID_OFFSET);
     }
 
     CATLASS_DEVICE
-    void ProcessC2Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12)
+    void ProcessC2Stage(FAGBlockInfo const &block, BlockMmadSdP &mm12, bool publish)
     {
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         const uint16_t flagId = SYNC_C2_TO_V2_FLAG[slot];
@@ -829,9 +853,24 @@ private:
             ubMm2ResTensor[slot], dpLayout, Catlass::Arch::PositionUB{});
         mm12(dy, v, dp, Catlass::GemmCoord(
             block.s1Extend, block.s2Extend, vHeadDim_));
+        if (!publish) return;
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(flagId);
         AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
             flagId + V0_V1_FLAG_ID_OFFSET);
+    }
+
+    CATLASS_DEVICE
+    void PublishC12Stage(FAGBlockInfo const &block)
+    {
+        const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
+        const uint16_t c1FlagId = SYNC_C1_TO_V1_FLAG[slot];
+        const uint16_t c2FlagId = SYNC_C2_TO_V2_FLAG[slot];
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(c1FlagId);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
+            c1FlagId + V0_V1_FLAG_ID_OFFSET);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(c2FlagId);
+        AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_FIX>(
+            c2FlagId + V0_V1_FLAG_ID_OFFSET);
     }
 
     CATLASS_DEVICE
@@ -968,6 +1007,18 @@ private:
     }
 
     CATLASS_DEVICE
+    void PrepareV12Stage()
+    {
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
+            SYNC_C5_TO_V1_FLAG);
+        AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
+            SYNC_C34_TO_V2_FLAG);
+        // CrossCoreWaitFlag is enqueued on MTE3.  Drain that queue here so the
+        // ownership tokens are consumed before the scalar-side SyncAll.
+        AscendC::PipeBarrier<PIPE_MTE3>();
+    }
+
+    CATLASS_DEVICE
     void ProcessV1Stage(
         FAGBlockInfo const &block,
         uint32_t subBlockIdx)
@@ -979,7 +1030,8 @@ private:
 
         // Before task 1 and later overwrite P in L1, C5 must return ownership
         // of the buffer used by the preceding task.
-        if (block.taskId != 0) {
+        if (block.taskId != 0 &&
+            !(IS_DTM && block.issueLane == 0 && block.issueRound != 0)) {
             AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
                 SYNC_C5_TO_V1_FLAG);
         }
@@ -1060,7 +1112,8 @@ private:
 
         // Before task 1 and later overwrite dS in L1, C3/C4 must return
         // ownership of the buffer used by the preceding task.
-        if (block.taskId != 0) {
+        if (block.taskId != 0 &&
+            !(IS_DTM && block.issueLane == 0 && block.issueRound != 0)) {
             AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE3>(
                 SYNC_C34_TO_V2_FLAG);
         }
