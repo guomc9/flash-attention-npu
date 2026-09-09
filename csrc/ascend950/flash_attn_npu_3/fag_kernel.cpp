@@ -649,6 +649,14 @@ private:
                         // pending back-end is flushed at the round end below;
                         // every core still joins the round barriers so the
                         // SyncAll counts stay matched across cores.
+                        // In a partial final round, cores without lane 0 must
+                        // still match active cores' C12-to-V12 sync #2.
+                        if (issueLane == 0 && issueRound != 0) {
+#ifdef __DAV_VEC__
+                            AscendC::PipeBarrier<PIPE_ALL>();
+#endif
+                            AscendC::SyncAll<false>();
+                        }
                         break;
                     } else {
                         if (taskId != 0) {
@@ -686,6 +694,16 @@ private:
                 ProcessC1Stage(block, mm12);
                 ProcessC2Stage(block, mm12);
 #endif
+                if constexpr (IS_DTM) {
+                    // Sync #2: DTM(r) and C12(r+1) converge before V12(r+1).
+                    // Round 0 has no preceding DTM and needs no second sync.
+                    if (issueLane == 0 && issueRound != 0) {
+#ifdef __DAV_VEC__
+                        AscendC::PipeBarrier<PIPE_ALL>();
+#endif
+                        AscendC::SyncAll<false>();
+                    }
+                }
 #ifdef __DAV_CUBE__
                 if (hasPendingPrev) {
                     ProcessC5Stage(previousBlock_, true, mm345);
@@ -693,16 +711,6 @@ private:
                 }
 #endif
 #ifdef __DAV_VEC__
-                if constexpr (IS_DTM) {
-                    // CBN=2 lane 1 has completed both C12 tiles and C345 for
-                    // lane 0. C345 releases shared MM12/C345 resources, so it
-                    // must precede the cut; V12(lane 0) follows the cut.
-                    if (continuousBlockNum_ == 2 &&
-                        issueLane + 1 == continuousBlockNum_ && issueRound != 0 &&
-                        issueRound + 1 < totalRounds_) {
-                        AscendC::PipeBarrier<PIPE_ALL>();
-                        AscendC::SyncAll<false>();
-                    }
                 if (hasPendingPrev) {
                     ProcessV1Stage(previousBlock_, subBlockIdx);
                     ProcessV2Stage(previousBlock_, subBlockIdx);
