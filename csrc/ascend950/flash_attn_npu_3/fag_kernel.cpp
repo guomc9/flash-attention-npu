@@ -652,9 +652,7 @@ private:
                         // In a partial final round, cores without lane 0 must
                         // still match active cores' C12-to-V12 sync #2.
                         if (issueLane == 0 && issueRound != 0) {
-#ifdef __DAV_VEC__
                             AscendC::PipeBarrier<PIPE_ALL>();
-#endif
                             AscendC::SyncAll<false>();
                         }
                         break;
@@ -698,9 +696,7 @@ private:
                     // Sync #2: DTM(r) and C12(r+1) converge before V12(r+1).
                     // Round 0 has no preceding DTM and needs no second sync.
                     if (issueLane == 0 && issueRound != 0) {
-#ifdef __DAV_VEC__
                         AscendC::PipeBarrier<PIPE_ALL>();
-#endif
                         AscendC::SyncAll<false>();
                     }
                 }
