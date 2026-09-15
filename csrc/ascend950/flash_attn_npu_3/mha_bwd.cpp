@@ -344,10 +344,20 @@ mha_bwd(
     // lengths) before launching the raw mixed AIC/AIV kernel on the ACL stream.
     stream = c10_npu::getCurrentNPUStream().stream(true);
 
+    // The deterministic BN2S2 tiling trims idle cores for small shapes
+    // (fag_tiling.cpp): every launched core pays the deterministic prologue
+    // and the per-round grid barrier, so launch exactly what the tiling asks
+    // for.  Non-deterministic paths keep usedCoreNum == aic_num.
+    const uint32_t launch_cores =
+        (fag_tiling_data.usedCoreNum > 0 &&
+         fag_tiling_data.usedCoreNum <= aic_num)
+            ? fag_tiling_data.usedCoreNum
+            : aic_num;
+
 #define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP) \
     FlashAttentionV3Bwd950<                                                     \
         DTYPE, FAGTiling950::Layout::INPUT_LAYOUT,                              \
-        IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP><<<aic_num, nullptr, stream>>>( \
+        IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP><<<launch_cores, nullptr, stream>>>( \
             ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask,                  \
             ptr(softmax_lse), cu_q, cu_k, ptr(dq), ptr(dk), ptr(dv),            \
             ptr(workspace), ptr(tiling_device))

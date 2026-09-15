@@ -89,7 +89,11 @@ inline Selection SelectSchedule(
         }
         // Top-left aligned square causal with an even batch count: the
         // LEFT_UP fold zips adjacent batches, which is the cheapest schedule.
-        if (((batchBh & 1) == 0) && m == n) {
+        // Exception for tiny single-tile squares (m == n == 1): the fold
+        // collapses both (batch, head) lanes into one serial column (two
+        // rounds on a single core), while the dense schedule runs them on two
+        // cores in one round and the 128x128 causal mask costs almost nothing.
+        if (((batchBh & 1) == 0) && m == n && !(m == 1 && n == 1)) {
             sel.kind = KIND_LEFT_UP_CAUSAL_SWIZZLE;
             sel.supported = true;
             return sel;

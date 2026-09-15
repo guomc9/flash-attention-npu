@@ -367,8 +367,25 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
         // per-core private buffer + early cast only applies to MHA (g == 1);
         // GQA keeps the ordered atomic accumulation in the full workspaces.
         tiling.detPrivDkv = (g == 1) ? 1U : 0U;
-        tiling.detMaxRound = static_cast<uint64_t>(
-            fag_det_host::ScheduleMaxRound(sel.kind, bh, m, n, g, k));
+        // Idle-core trim: small shapes need far fewer cores than the device
+        // has, yet every launched core pays the deterministic prologue
+        // (event/flag init, private dk/dv slot setup) plus one grid barrier
+        // per round.  Keep the round count identical and launch only the
+        // smallest core count that sustains it; the per-core task assignment
+        // for the kept cores is unchanged because the decode is a function of
+        // (round, core) and the core index stays 0..activeCore-1.
+        const int64_t maxRound =
+            fag_det_host::ScheduleMaxRound(sel.kind, bh, m, n, g, k);
+        int64_t activeCore = k;
+        for (int64_t c = 1; c < k; ++c) {
+            if (fag_det_host::ScheduleMaxRound(sel.kind, bh, m, n, g, c) ==
+                maxRound) {
+                activeCore = c;
+                break;
+            }
+        }
+        tiling.usedCoreNum = static_cast<uint32_t>(activeCore);
+        tiling.detMaxRound = static_cast<uint64_t>(maxRound);
         tiling.dqPostAbsorb = 0;
         // One scheduled task per cube core per round; the paired AIVs are
         // driven by the existing V1/V2 pipeline plus the per-column dk/dv
