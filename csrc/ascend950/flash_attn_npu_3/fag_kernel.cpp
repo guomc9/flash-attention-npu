@@ -36,8 +36,15 @@ static constexpr uint16_t SYNC_C34_TO_V2_FLAG = 8;
 static constexpr uint16_t SYNC_C5_TO_V1_FLAG = 9;
 // BN2S2: mode-0 fix barrier shared by every AIC to pin the atomic dq/dk/dv
 // accumulation of one schedule round before the next round is issued.
+// Late-wait variant: two alternating flag IDs, one per round parity.  The
+// SET for round r still happens at the round end, but the WAIT is deferred
+// to round r+1 and lands on the flag of round r's parity — an
+// already-armed generation, so the front-end (C1/C2/C5) of round r+1 runs
+// before the rendezvous instead of behind it.  Ordering guarantee is
+// unchanged: round r+1's ordered atomics (dq; dv on the shared path) still
+// wait for every core's SET of round r.
 static constexpr uint8_t DETER_FIX_SYNC_MODE = 0;
-static constexpr uint16_t SYNC_DQ_ROUND_FLAG = 10;
+static constexpr uint16_t SYNC_DQ_ROUND_FLAG[2] = {10, 15};
 // BN2S2 per-column dk/dv conversion: AIC signals a completed private column,
 // the paired AIVs cast it to the bf16 output and release the buffer.
 static constexpr uint16_t SYNC_C34_TO_V5_FLAG = 11;  // dk column ready
@@ -961,7 +968,19 @@ private:
                 const bool colEnd =
                     IsColumnEndBn2s2(coreIdx, pending);
 #ifdef __DAV_CUBE__
+                if (!detPrivDkv_ && step > 0) {
+                    // Shared-workspace dv (GQA / TND flat): the C5 atomic
+                    // adds are round-ordered too, so the wait precedes C5.
+                    AscendC::CrossCoreWaitFlag<DETER_FIX_SYNC_MODE, PIPE_FIX>(
+                        SYNC_DQ_ROUND_FLAG[(step + 1) & 1]);
+                }
                 ProcessC5StageBn2s2(pending, true, mm345, colEnd);
+                if (detPrivDkv_ && step > 0) {
+                    // Private dv needs no round ordering; only the dq
+                    // atomics in C34 do, so the wait is as late as possible.
+                    AscendC::CrossCoreWaitFlag<DETER_FIX_SYNC_MODE, PIPE_FIX>(
+                        SYNC_DQ_ROUND_FLAG[(step + 1) & 1]);
+                }
                 ProcessC34StageBn2s2(pending, true, mm345, colEnd);
 #endif
 #ifdef __DAV_VEC__
@@ -970,6 +989,15 @@ private:
                 ProcessDkvCastStage(pending, subBlockIdx, colEnd);
 #endif
                 hasPending = false;
+            } else {
+#ifdef __DAV_CUBE__
+                // One wait per core per round keeps the flag generations
+                // aligned even on empty rounds.
+                if (step > 0) {
+                    AscendC::CrossCoreWaitFlag<DETER_FIX_SYNC_MODE, PIPE_FIX>(
+                        SYNC_DQ_ROUND_FLAG[(step + 1) & 1]);
+                }
+#endif
             }
             if (valid) {
                 pending = block;
@@ -978,13 +1006,15 @@ private:
             }
 #ifdef __DAV_CUBE__
             AscendC::CrossCoreSetFlag<DETER_FIX_SYNC_MODE, PIPE_FIX>(
-                SYNC_DQ_ROUND_FLAG);
-            AscendC::CrossCoreWaitFlag<DETER_FIX_SYNC_MODE, PIPE_FIX>(
-                SYNC_DQ_ROUND_FLAG);
+                SYNC_DQ_ROUND_FLAG[step & 1]);
 #endif
         }
         if (hasPending) {
 #ifdef __DAV_CUBE__
+            // Drain: the last task's ordered atomics belong to the round
+            // after totalRounds_-1, so they wait that round's generation.
+            AscendC::CrossCoreWaitFlag<DETER_FIX_SYNC_MODE, PIPE_FIX>(
+                SYNC_DQ_ROUND_FLAG[(totalRounds_ + 1) & 1]);
             ProcessC5StageBn2s2(pending, false, mm345, true);
             ProcessC34StageBn2s2(pending, false, mm345, true);
 #endif
